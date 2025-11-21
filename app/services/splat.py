@@ -134,6 +134,7 @@ class Splat:
             RuntimeError: If SPLAT! fails to execute.
         """
         logger.debug(f"Coverage prediction request: {request.json()}")
+        logger.info(f"Processing SPLAT! request for Lat: {request.lat}, Lon: {request.lon}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             try:
@@ -536,7 +537,7 @@ class Splat:
             east = float(box.find("kml:east", namespace).text)
             west = float(box.find("kml:west", namespace).text)
 
-            logger.debug(
+            logger.info(
                 f"Extracted bounding box: north={north}, south={south}, east={east}, west={west}"
             )
 

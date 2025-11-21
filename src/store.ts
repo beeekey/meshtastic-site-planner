@@ -59,6 +59,10 @@ const useStore = defineStore('store', {
     setTxCoords(lat: number, lon: number) {
       this.splatParams.transmitter.tx_lat = lat
       this.splatParams.transmitter.tx_lon = lon
+      console.log('Transmitter coordinates updated:', lat, lon)
+      if (this.map) {
+        this.map.setView([lat, lon], this.map.getZoom())
+      }
     },
     removeSite(index: number) {
       if (!this.map) {
@@ -77,16 +81,27 @@ const useStore = defineStore('store', {
         return;
       }
 
+      console.log('Redrawing sites. Current localSites:', this.localSites.length);
+
       // Remove existing GeoRasterLayers
+      let removedCount = 0;
       this.map.eachLayer((layer: L.Layer) => {
         if (layer instanceof GeoRasterLayer) {
           this.map!.removeLayer(layer);
+          removedCount++;
         }
       });
+      console.log(`Removed ${removedCount} existing GeoRasterLayers`);
 
       // Add GeoRasterLayers back to the map
-      this.localSites.forEach((site: Site) => {
+      this.localSites.forEach((site: Site, index: number) => {
         if (!site.visible) return;
+
+        console.log(`Adding layer ${index} with bounds:`, site.raster.xmin, site.raster.ymin, site.raster.xmax, site.raster.ymax);
+
+        // DEBUG: Draw a rectangle around the bounds
+        const bounds = [[site.raster.ymin, site.raster.xmin], [site.raster.ymax, site.raster.xmax]];
+        L.rectangle(bounds as L.LatLngBoundsExpression, { color: index === 0 ? 'blue' : 'green', weight: 1, fill: false }).addTo(this.map as L.Map);
 
         const rasterLayer = new GeoRasterLayer({
           georaster: site.raster,
@@ -169,6 +184,15 @@ const useStore = defineStore('store', {
       this.map.on("baselayerchange", () => {
         this.redrawSites(); // Re-apply the GeoRasterLayer on top
       });
+
+      this.map.on("click", (e: L.LeafletMouseEvent) => {
+        const { lat, lng } = e.latlng;
+        this.setTxCoords(lat, lng);
+        if (this.currentMarker) {
+          this.currentMarker.setLatLng([lat, lng]);
+        }
+      });
+
       this.currentMarker = L.marker(position, { icon: redPinMarker }).addTo(this.map as L.Map).bindPopup("Transmitter site"); // Variable to hold the current marker
       this.redrawSites();
     },
@@ -210,6 +234,10 @@ const useStore = defineStore('store', {
           min_dbm: this.splatParams.display.min_dbm,
           max_dbm: this.splatParams.display.max_dbm,
         };
+
+        // Force lat/lon to be numbers
+        payload.lat = Number(payload.lat);
+        payload.lon = Number(payload.lon);
 
         console.log("Payload:", payload);
         this.simulationState = 'running';
@@ -267,6 +295,14 @@ const useStore = defineStore('store', {
               // Get address
               const addressName = await this.reverseGeocode(this.splatParams.transmitter.tx_lat, this.splatParams.transmitter.tx_lon);
               this.splatParams.transmitter.name = `${this.splatParams.transmitter.tx_height}m AGL - ${addressName}`;
+
+              console.log('Adding layer with raster data:', {
+                taskId,
+                width: geoRaster.width,
+                height: geoRaster.height,
+                bounds: JSON.stringify([geoRaster.xmin, geoRaster.ymin, geoRaster.xmax, geoRaster.ymax]),
+                bufferSize: bufferForStorage.byteLength
+              });
 
               this.localSites.push({
                 params: cloneObject(this.splatParams),
