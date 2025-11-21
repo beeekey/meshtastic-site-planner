@@ -11,6 +11,7 @@ Endpoints:
 """
 
 import redis
+import json
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,11 +62,16 @@ def run_splat(task_id: str, request: CoveragePredictionRequest):
     """
     try:
         logger.info(f"Starting SPLAT! coverage prediction for task {task_id}.")
-        geotiff_data = splat_service.coverage_prediction(request)
+        geotiff_data, png_data, bounds = splat_service.coverage_prediction(request)
 
         # Log before storing in Redis
         logger.info(f"Storing result in Redis for task {task_id}")
         redis_client.setex(task_id, 3600, geotiff_data)
+        redis_client.setex(f"{task_id}:png", 3600, png_data)
+        redis_client.setex(f"{task_id}:bounds", 3600, json.dumps(bounds))
+        # Store metadata separately for easy retrieval
+        redis_client.setex(f"{task_id}:metadata", 3600, request.model_dump_json())
+        
         redis_client.setex(f"{task_id}:status", 3600, "completed")
         logger.info(f"Task {task_id} marked as completed.")
     except Exception as e:
@@ -116,7 +122,16 @@ async def get_status(task_id: str):
         logger.warning(f"Task {task_id} not found in Redis.")
         return JSONResponse({"error": "Task not found"}, status_code=404)
 
-    return JSONResponse({"task_id": task_id, "status": status.decode("utf-8")})
+    response_data = {"task_id": task_id, "status": status.decode("utf-8")}
+    
+    if response_data["status"] == "completed":
+        bounds_str = redis_client.get(f"{task_id}:bounds")
+        if bounds_str:
+            # Parse bounds from JSON
+            bounds = json.loads(bounds_str.decode("utf-8"))
+            response_data["bounds"] = bounds
+
+    return JSONResponse(response_data)
 
 @app.get("/result/{task_id}")
 async def get_result(task_id: str):
@@ -160,5 +175,51 @@ async def get_result(task_id: str):
 
     logger.info(f"Task {task_id} is still processing.")
     return JSONResponse({"status": "processing"})
+
+@app.get("/result/{task_id}/png")
+async def get_result_png(task_id: str):
+    """
+    Retrieve SPLAT! task result as PNG.
+    """
+    status = redis_client.get(f"{task_id}:status")
+    if not status:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+
+    status = status.decode("utf-8")
+    if status == "completed":
+        png_data = redis_client.get(f"{task_id}:png")
+        if not png_data:
+            return JSONResponse({"error": "No PNG result found"}, status_code=500)
+
+        png_file = io.BytesIO(png_data)
+        return StreamingResponse(
+            png_file,
+            media_type="image/png"
+        )
+    elif status == "failed":
+        error = redis_client.get(f"{task_id}:error")
+        return JSONResponse({"status": "failed", "error": error.decode("utf-8")})
+
+    return JSONResponse({"status": "processing"})
+
+@app.get("/result/{task_id}/metadata")
+async def get_result_metadata(task_id: str):
+    """
+    Retrieve simulation metadata for a task.
+    """
+    status = redis_client.get(f"{task_id}:status")
+    if not status:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+
+    status = status.decode("utf-8")
+    if status == "completed":
+        metadata = redis_client.get(f"{task_id}:metadata")
+        if not metadata:
+            return JSONResponse({"error": "No metadata found"}, status_code=404)
+
+        return JSONResponse(json.loads(metadata.decode("utf-8")))
+    
+    return JSONResponse({"error": "Task not completed"}, status_code=400)
+
 
 app.mount("/", StaticFiles(directory="app/ui", html=True), name="ui")

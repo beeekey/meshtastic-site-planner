@@ -1,10 +1,12 @@
 export interface Site {
     params: SplatParams;
     taskId: string;
-    raster: any;
+    raster?: any;
     visible: boolean;
     opacity: number;
-    rawBuffer: ArrayBuffer;
+    rawBuffer?: ArrayBuffer;
+    imageUrl?: string;
+    bounds?: [[number, number], [number, number]];
 }
 export interface SplatParams {
     transmitter: {
@@ -35,6 +37,7 @@ export interface SplatParams {
         time_fraction: number;
         simulation_extent: number;
         high_resolution: boolean;
+        clear_previous: boolean;
     };
     display: {
         color_scale: string;

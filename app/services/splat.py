@@ -128,7 +128,10 @@ class Splat:
             request (CoveragePredictionRequest): The coverage prediction request object.
 
         Returns:
-            bytes: the SPLAT! coverage prediction as a GeoTIFF.
+            Tuple[bytes, bytes, Tuple[float, float, float, float]]: 
+                - GeoTIFF bytes
+                - PNG bytes
+                - Bounds (north, south, east, west)
 
         Raises:
             RuntimeError: If SPLAT! fails to execute.
@@ -240,10 +243,17 @@ class Splat:
                     with open(os.path.join(tmpdir, "output.kml"), "rb") as kml_file:
                         ppm_data = ppm_file.read()
                         kml_data = kml_file.read()
-                        geotiff_data = Splat._create_splat_geotiff(ppm_data,kml_data,request.colormap,request.min_dbm,request.max_dbm)
+                        geotiff_data, png_data, bounds = Splat._create_splat_geotiff(
+                            ppm_bytes=ppm_data,
+                            kml_bytes=kml_data,
+                            colormap_name=request.colormap,
+                            min_dbm=request.min_dbm,
+                            max_dbm=request.max_dbm,
+                            metadata={"MESHTASTIC_PARAMS": request.model_dump_json()}
+                        )
 
                 logger.info("SPLAT! coverage prediction completed successfully.")
-                return geotiff_data
+                return geotiff_data, png_data, bounds
 
             except Exception as e:
                 logger.error(f"Error during coverage prediction: {e}")
@@ -347,8 +357,8 @@ class Splat:
             # Create the .qth file content
             contents = (
                 f"{name}\n"
-                f"{latitude:.6f}\n"
-                f"{abs(longitude) if longitude < 0 else 360 - longitude:.6f}\n"  # SPLAT! expects west longitude as a positive number.
+                f"{latitude:.10f}\n"
+                f"{abs(longitude) if longitude < 0 else 360 - longitude:.10f}\n"  # SPLAT! expects west longitude as a positive number.
                 f"{elevation:.2f}\n"
             )
             logger.debug(f"Generated .qth file contents:\n{contents}")
@@ -504,7 +514,8 @@ class Splat:
             colormap_name: str,
             min_dbm: float,
             max_dbm: float,
-            null_value: int = 0  # Define the null value for transparency
+            null_value: int = 0,  # Define the null value for transparency
+            metadata: dict = None
     ) -> bytes:
         """
         Generate GeoTIFF file content from SPLAT! PPM and KML data, with transparency for null areas.
@@ -515,10 +526,15 @@ class Splat:
             colormap_name (str): Name of the matplotlib colormap to use for the GeoTIFF.
             min_dbm (float): Minimum dBm value for the colormap scale.
             max_dbm (float): Maximum dBm value for the colormap scale.
+            min_dbm (float): Minimum dBm value for the colormap scale.
+            max_dbm (float): Maximum dBm value for the colormap scale.
             null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
 
         Returns:
-            bytes: The binary content of the resulting GeoTIFF file.
+            Tuple[bytes, bytes, Tuple[float, float, float, float]]:
+                - GeoTIFF bytes
+                - PNG bytes
+                - Bounds (north, south, east, west)
 
         Raises:
             RuntimeError: If the conversion process fails.
@@ -537,16 +553,36 @@ class Splat:
             east = float(box.find("kml:east", namespace).text)
             west = float(box.find("kml:west", namespace).text)
 
-            logger.info(
-                f"Extracted bounding box: north={north}, south={south}, east={east}, west={west}"
-            )
-
-            # Read PPM content
+            # CRITICAL FIX: SPLAT! KML output often reports the north bound as the center of the top pixel
+            # or excludes the last pixel height, resulting in a 1-pixel Y-axis shift (approx 90m).
+            # We recalculate the north bound assuming square pixels (standard for SRTM) to ensure alignment.
+            # Resolution x = (east - west) / width
+            # Resolution y = Resolution x (square pixels)
+            # North = South + (Height * Resolution y)
+            
+            # Read PPM content first to get dimensions
             logger.debug("Reading PPM content.")
             with Image.open(io.BytesIO(ppm_bytes)) as img:
                 # Convert to RGBA directly
                 img_rgba = img.convert("RGBA")
                 img_array = np.array(img_rgba)
+            
+            height, width, channels = img_array.shape
+            
+            # Calculate resolution from X axis (reliable)
+            res_x = (east - west) / width
+            
+            # Recalculate North bound
+            original_north = north
+            north = south + (height * res_x)
+            
+            logger.info(
+                f"Extracted bounding box: north={original_north}, south={south}, east={east}, west={west}"
+            )
+            logger.info(
+                f"Recalculated North bound: {north} (Diff: {north - original_north:.6f} deg)"
+            )
+
 
             # Log unique colors to debug transparency
             unique_colors, counts = np.unique(img_array.reshape(-1, 4), axis=0, return_counts=True)
@@ -597,12 +633,29 @@ class Splat:
                     # Move channels to first dimension (H, W, 4) -> (4, H, W)
                     data = np.moveaxis(img_array, -1, 0)
                     dst.write(data)
+                    
+                    # Store metadata in ImageDescription tag for easy browser reading
+                    if metadata:
+                        import json
+                        # Add bounds to metadata for precise restoration
+                        metadata["BOUNDS"] = [north, south, east, west]
+                        metadata_json = json.dumps(metadata)
+                        logger.info(f"Writing metadata to TIFF: {metadata_json[:200]}...")
+                        dst.update_tags(ImageDescription=metadata_json)
 
                 buffer.seek(0)
                 geotiff_bytes = buffer.read()
 
-            logger.info("GeoTIFF generation successful.")
-            return geotiff_bytes
+            # Write PNG to memory
+            with io.BytesIO() as png_buffer:
+                # Convert array back to image for saving as PNG
+                # img_array is (H, W, 4)
+                img_png = Image.fromarray(img_array, 'RGBA')
+                img_png.save(png_buffer, format="PNG")
+                png_bytes = png_buffer.getvalue()
+
+            logger.info("GeoTIFF and PNG generation successful.")
+            return geotiff_bytes, png_bytes, (north, south, east, west)
 
         except Exception as e:
             logger.error(f"Error during GeoTIFF generation: {e}")

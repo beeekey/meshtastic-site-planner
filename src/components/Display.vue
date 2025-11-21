@@ -31,6 +31,14 @@
                 <div class="invalid-feedback">Transparency must be between 0 and 100 (default: 50).</div>
             </div>
         </div>
+        <div class="row g-2 mt-2">
+            <div class="col-12">
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="showBorders" v-model="store.showBorders" @change="store.redrawSites()">
+                    <label class="form-check-label" for="showBorders">Show Debug Borders</label>
+                </div>
+            </div>
+        </div>
     <div class="mt-3 text-center">
       <div>
         <img
@@ -51,5 +59,6 @@
 
 <script setup lang="ts">
 import { useStore } from "../store.ts";
-const display = useStore().splatParams.display;
+const store = useStore();
+const display = store.splatParams.display;
 </script>

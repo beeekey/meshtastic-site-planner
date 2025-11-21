@@ -2,10 +2,15 @@
   <div>
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="m-0">Layers</h6>
-      <label class="btn btn-sm btn-outline-light">
-        Import Layer
-        <input type="file" accept=".tif,.tiff" @change="handleImport" hidden />
+      <div class="btn-group btn-group-sm">
+        <button class="btn btn-outline-danger" @click="store.clearAllSites()" v-if="store.localSites.length > 0" title="Clear All Layers">
+          Clear All
+        </button>
+        <label for="import-layer" class="btn btn-sm btn-outline-light">
+        <i class="bi bi-upload"></i> Import Layer
       </label>
+      <input type="file" id="import-layer" accept=".tif,.tiff" @change="handleImport" style="display: none;">
+      </div>
     </div>
 
     <ul class="list-group">
@@ -54,7 +59,6 @@
 </template>
 
 <script setup lang="ts">
-import { toRaw } from 'vue';
 import { useStore } from '../store.ts';
 import { saveAs } from 'file-saver';
 
@@ -70,22 +74,52 @@ const updateOpacity = (index: number, event: Event) => {
   store.updateLayer(index, { opacity: parseFloat(target.value) });
 };
 
-const downloadLayer = (index: number) => {
+const downloadLayer = async (index: number) => {
   const site = store.localSites[index];
-  if (site && site.rawBuffer) {
-    const buffer = toRaw(site.rawBuffer);
-    const blob = new Blob([buffer], { type: 'image/tiff' });
-    const filename = `${site.params.transmitter.name.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.tif`;
-    saveAs(blob, filename);
-  } else {
-    alert("No raw data available for this layer.");
+
+  if (!site) {
+    alert("Layer not found.");
+    return;
   }
+  
+  let buffer = site.rawBuffer;
+  if (!buffer) {
+    // If rawBuffer is missing (e.g. PNG mode), fetch it from the server
+    try {
+        const response = await fetch(`/result/${site.taskId}`);
+        if (!response.ok) throw new Error("Failed to fetch GeoTIFF");
+        buffer = await response.arrayBuffer();
+    } catch (e) {
+        console.error("Error downloading layer:", e);
+        alert("Failed to download layer.");
+        return;
+    }
+  }
+
+  if (!buffer) {
+      alert("No raw data available for this layer and failed to fetch.");
+      return;
+  }
+
+  console.log(`Downloading layer ${index}, buffer size: ${buffer.byteLength}`);
+
+  // Download the GeoTIFF
+  const blob = new Blob([buffer], { type: 'image/tiff' });
+  const filename = `${site.params.transmitter.name.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.tif`;
+  saveAs(blob, filename);
 };
 
 const handleImport = (event: Event) => {
   const target = event.target as HTMLInputElement;
   if (target.files && target.files.length > 0) {
-    store.importLayer(target.files[0]);
+    const file = target.files[0];
+    if (!file.name.endsWith('.tif') && !file.name.endsWith('.tiff')) {
+      alert('Please select a GeoTIFF file (.tif or .tiff)');
+      return;
+    }
+
+    // Metadata is now embedded in the TIFF file, no need for separate JSON
+    store.importLayer(file);
     target.value = ''; // Reset input
   }
 };
