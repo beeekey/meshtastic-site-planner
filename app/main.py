@@ -148,6 +148,7 @@ async def get_result(task_id: str):
             return JSONResponse({"error": "No result found"}, status_code=500)
 
         geotiff_file = io.BytesIO(geotiff_data)
+        logger.info(f"Serving GeoTIFF for task {task_id}. Size: {len(geotiff_data)} bytes. Header: {geotiff_data[:20]}")
         return StreamingResponse(
             geotiff_file,
             media_type="image/tiff",

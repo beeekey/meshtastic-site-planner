@@ -503,7 +503,7 @@ class Splat:
             colormap_name: str,
             min_dbm: float,
             max_dbm: float,
-            null_value: int = 255  # Define the null value for transparency
+            null_value: int = 0  # Define the null value for transparency
     ) -> bytes:
         """
         Generate GeoTIFF file content from SPLAT! PPM and KML data, with transparency for null areas.
@@ -514,7 +514,7 @@ class Splat:
             colormap_name (str): Name of the matplotlib colormap to use for the GeoTIFF.
             min_dbm (float): Minimum dBm value for the colormap scale.
             max_dbm (float): Maximum dBm value for the colormap scale.
-            null_value (int): Pixel value in the PPM that represents null areas. Defaults to 255.
+            null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
 
         Returns:
             bytes: The binary content of the resulting GeoTIFF file.
@@ -543,32 +543,41 @@ class Splat:
             # Read PPM content
             logger.debug("Reading PPM content.")
             with Image.open(io.BytesIO(ppm_bytes)) as img:
-                img_array = np.array(
-                    img.convert("L")
-                )  # Convert to single-channel grayscale
-                img_array = np.clip(img_array, 0, 255).astype("uint8")
+                # Convert to RGBA directly
+                img_rgba = img.convert("RGBA")
+                img_array = np.array(img_rgba)
 
-            logger.debug(f"PPM image dimensions: {img_array.shape}")
+            # Log unique colors to debug transparency
+            unique_colors, counts = np.unique(img_array.reshape(-1, 4), axis=0, return_counts=True)
+            # Sort by count descending
+            sorted_indices = np.argsort(-counts)
+            top_colors = unique_colors[sorted_indices[:5]]
+            top_counts = counts[sorted_indices[:5]]
+            logger.info(f"Top 5 colors in image (RGBA): {top_colors}")
+            logger.info(f"Top 5 counts: {top_counts}")
 
-            # Mask null values
-            img_array = np.where(img_array == null_value, 255, img_array)  # Optionally set to 0
-            no_data_value = null_value
+            # Mask black pixels (near 0,0,0) to be transparent
+            # Using a small tolerance of 10 to catch compression artifacts or near-black colors
+            black_pixels = (img_array[:, :, 0] < 10) & (img_array[:, :, 1] < 10) & (img_array[:, :, 2] < 10)
+            img_array[black_pixels] = [0, 0, 0, 0]
+
+            # Mask white pixels (near 255,255,255) to be transparent
+            # Using a tolerance of 10 (so > 245)
+            white_pixels = (img_array[:, :, 0] > 245) & (img_array[:, :, 1] > 245) & (img_array[:, :, 2] > 245)
+            img_array[white_pixels] = [0, 0, 0, 0]
+
+            # Log unique colors AFTER masking
+            unique_colors_post, counts_post = np.unique(img_array.reshape(-1, 4), axis=0, return_counts=True)
+            sorted_indices_post = np.argsort(-counts_post)
+            top_colors_post = unique_colors_post[sorted_indices_post[:5]]
+            top_counts_post = counts_post[sorted_indices_post[:5]]
+            logger.info(f"Top 5 colors AFTER masking (RGBA): {top_colors_post}")
+            logger.info(f"Top 5 counts AFTER masking: {top_counts_post}")
 
             # Create GeoTIFF using Rasterio
-            height, width = img_array.shape
+            height, width, channels = img_array.shape
             transform = from_bounds(west, south, east, north, width, height)
             logger.debug(f"GeoTIFF transform matrix: {transform}")
-
-            # Generate colormap with transparency
-            cmap = plt.get_cmap(colormap_name, 256)  # colormap with 256 levels
-            cmap_norm = plt.Normalize(vmin=min_dbm, vmax=max_dbm)  # Normalize based on dBm range
-            cmap_values = np.linspace(min_dbm, max_dbm, 255)
-
-            # Map data values to RGB for visible colors
-            rgb_colors = (cmap(cmap_norm(cmap_values))[:, :3] * 255).astype(int)
-
-            # Initialize GDAL-compatible colormap with transparency for null values
-            gdal_colormap = {i: tuple(rgb) + (255,) for i, rgb in enumerate(rgb_colors)}
 
             # Write GeoTIFF to memory
             with io.BytesIO() as buffer:
@@ -578,16 +587,15 @@ class Splat:
                         driver="GTiff",
                         height=height,
                         width=width,
-                        count=1,  # Single-band data
+                        count=4,  # RGBA
                         dtype="uint8",
                         crs="EPSG:4326",
                         transform=transform,
-                        photometric="palette",  # Colormap interpretation
                         compress="lzw",
-                        nodata=no_data_value,  # Set NoData value
                 ) as dst:
-                    dst.write(img_array, 1)  # Write the raster data
-                    dst.write_colormap(1, gdal_colormap)  # Attach the colormap
+                    # Move channels to first dimension (H, W, 4) -> (4, H, W)
+                    data = np.moveaxis(img_array, -1, 0)
+                    dst.write(data)
 
                 buffer.seek(0)
                 geotiff_bytes = buffer.read()

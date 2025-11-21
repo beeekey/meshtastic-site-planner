@@ -65,12 +65,7 @@
                 <span class="button-text">{{ buttonText() }}</span>
               </button>
             </div>
-            <ul class="list-group mt-3">
-              <li class="list-group-item d-flex justify-content-between align-items-center" v-for="(site, index) in store.$state.localSites" :key="site.taskId">
-                <span>{{ site.params.transmitter.name }}</span>
-                <button type="button" @click="store.removeSite(index)" class="btn-close" aria-label="Close"></button>
-              </li>
-            </ul>
+            <LayerManager class="mt-3" />
           </div>
         </div>
       </div>
@@ -89,6 +84,7 @@ import Receiver from "./components/Receiver.vue"
 import Environment from "./components/Environment.vue"
 import Simulation from "./components/Simulation.vue"
 import Display from "./components/Display.vue"
+import LayerManager from "./components/LayerManager.vue"
 
 import { useStore } from './store.ts'
 const store = useStore()
