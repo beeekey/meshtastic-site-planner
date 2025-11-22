@@ -1,12 +1,14 @@
 export interface Site {
+    id: string;
     params: SplatParams;
-    taskId: string;
+    taskId?: string;
     raster?: any;
     visible: boolean;
     opacity: number;
     rawBuffer?: ArrayBuffer;
     imageUrl?: string;
     bounds?: [[number, number], [number, number]];
+    geojson?: any;
 }
 export interface SplatParams {
     transmitter: {

@@ -14,7 +14,7 @@
     </div>
 
     <ul class="list-group">
-      <li class="list-group-item bg-dark text-white border-secondary" v-for="(site, index) in store.localSites" :key="site.taskId">
+      <li class="list-group-item bg-dark text-white border-secondary" v-for="(site, index) in store.localSites" :key="site.id">
         <div class="d-flex justify-content-between align-items-center mb-2">
           <div class="form-check form-switch">
             <input 
@@ -83,7 +83,7 @@ const downloadLayer = async (index: number) => {
   }
   
   let buffer = site.rawBuffer;
-  if (!buffer) {
+  if (!buffer && site.taskId) {
     // If rawBuffer is missing (e.g. PNG mode), fetch it from the server
     try {
         const response = await fetch(`/result/${site.taskId}`);

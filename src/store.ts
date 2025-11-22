@@ -91,6 +91,7 @@ const useStore = defineStore('store', {
 
       console.log('Redrawing sites. Current localSites:', this.localSites.length);
 
+      // Remove all previously tracked layer groups
       // Remove all previously tracked layers
       this.siteLayers.forEach(layer => {
         try {
@@ -103,10 +104,11 @@ const useStore = defineStore('store', {
       console.log('Removed existing tracked layers');
 
       // Add GeoRasterLayers back to the map
+      // Add GeoRasterLayers back to the map
       this.localSites.forEach((site: Site, index: number) => {
         if (!site.visible) return;
 
-        console.log(`Adding layer ${index}`);
+        console.log(`Adding layer ${index} (ID: ${site.id})`);
 
         let layerBounds: L.LatLngBoundsExpression | undefined;
 
@@ -125,15 +127,18 @@ const useStore = defineStore('store', {
           this.siteLayers.push(border);
         }
 
+        // Prioritize ImageURL (PNG) for stability, with pixelated rendering for quality
         if (site.imageUrl) {
           const imageOverlay = L.imageOverlay(site.imageUrl, layerBounds, {
             opacity: site.opacity,
-            interactive: false
+            interactive: false,
+            className: 'pixelated-overlay' // Add CSS class for pixelated rendering
           });
           imageOverlay.addTo(this.map as L.Map);
           imageOverlay.bringToFront();
           this.siteLayers.push(imageOverlay);
-        } else if (site.raster) {
+        } else if (site.raster && site.raster.width && site.raster.height) {
+          // Fallback to GeoRasterLayer if no PNG (e.g. imported files)
           const rasterLayer = new GeoRasterLayer({
             georaster: site.raster,
             opacity: site.opacity,
@@ -166,21 +171,37 @@ const useStore = defineStore('store', {
             }
           } as any);
           console.log(`Created GeoRasterLayer for layer ${index}`);
-          if (site.bounds) {
-            console.log(`Layer ${index} bounds (High Precision Check):`, site.bounds.map(pair => pair.map(c => c.toFixed(10))));
-          }
-          console.log(`Layer ${index} GeoRaster properties:`, {
-            ymin: site.raster.ymin,
-            ymax: site.raster.ymax,
-            xmin: site.raster.xmin,
-            xmax: site.raster.xmax,
-            pixelHeight: site.raster.pixelHeight,
-            pixelWidth: site.raster.pixelWidth
-          });
           rasterLayer.addTo(this.map as L.Map);
-          console.log(`Layer ${index} Leaflet Layer Bounds:`, rasterLayer.getBounds());
           rasterLayer.bringToFront();
           this.siteLayers.push(rasterLayer);
+        }
+
+        // Render GeoJSON if available
+        if (site.geojson) {
+          console.log(`Rendering GeoJSON for layer ${index}`);
+          const geoJsonLayer = L.geoJSON(site.geojson, {
+            pointToLayer: (_feature, latlng) => {
+              return L.circleMarker(latlng, {
+                radius: 6,
+                fillColor: "red",
+                color: "#fff",
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 1
+              });
+            },
+            onEachFeature: (feature, layer) => {
+              if (feature.properties) {
+                let popupContent = `<strong>${feature.properties.name || 'Node'}</strong>`;
+                if (feature.properties.height) popupContent += `<br>Height: ${feature.properties.height}m`;
+                if (feature.properties.power) popupContent += `<br>Power: ${feature.properties.power}dBm`;
+                layer.bindPopup(popupContent);
+              }
+            }
+          });
+          geoJsonLayer.addTo(this.map as L.Map);
+          geoJsonLayer.bringToFront();
+          this.siteLayers.push(geoJsonLayer);
         }
       });
     },
@@ -371,25 +392,52 @@ const useStore = defineStore('store', {
 
             // Fetch the GeoTIFF buffer immediately to store it
             let geoTiffBuffer: ArrayBuffer | undefined;
+            let geojsonData: any | undefined;
             try {
-              const response = await fetch(`/result/${taskId}`);
+              const response = await fetch(`/result/${taskId}?_t=${Date.now()}`);
               if (response.ok) {
                 geoTiffBuffer = await response.arrayBuffer();
+                console.log(`Fetched GeoTIFF buffer: ${geoTiffBuffer.byteLength} bytes`);
               } else {
                 console.error("Failed to fetch GeoTIFF for storage");
               }
+
+              // Fetch GeoJSON
+              const geojsonResponse = await fetch(`/result/${taskId}/geojson?_t=${Date.now()}`);
+              if (geojsonResponse.ok) {
+                geojsonData = await geojsonResponse.json();
+              }
             } catch (e) {
-              console.error("Error fetching GeoTIFF:", e);
+              console.error("Error fetching result data:", e);
+            }
+
+            // Parse GeoTIFF for consistent rendering with imported layers
+            let geoRaster: any = undefined;
+            if (geoTiffBuffer) {
+              try {
+                console.log(`Parsing GeoTIFF for task ${taskId}, size: ${geoTiffBuffer.byteLength}`);
+                // Clone buffer to prevent detachment issues
+                const bufferCopy = geoTiffBuffer.slice(0);
+                geoRaster = await parseGeoraster(bufferCopy);
+                console.log("Parsed GeoTIFF for display:", geoRaster);
+              } catch (e) {
+                console.error("Failed to parse GeoTIFF:", e);
+              }
+            } else {
+              console.error("geoTiffBuffer is undefined or empty!");
             }
 
             this.localSites.push({
+              id: taskId,
               params: cloneObject(this.splatParams),
               taskId,
               visible: true,
               opacity: this.splatParams.display.overlay_transparency / 100,
-              imageUrl: `/result/${taskId}/png`,
+              imageUrl: `/result/${taskId}/png`, // Fallback if raster fails
               bounds: leafletBounds,
-              rawBuffer: geoTiffBuffer
+              rawBuffer: geoTiffBuffer,
+              raster: geoRaster,
+              geojson: geojsonData
             });
             this.currentMarker!.removeFrom(this.map as L.Map);
             this.redrawSites();
@@ -486,8 +534,7 @@ const useStore = defineStore('store', {
             simulation_extent: 30.0,
             high_resolution: false,
             clear_previous: false,
-            max_dbm: -80.0,
-            min_dbm: -130.0
+
           },
           display: {
             color_scale: 'plasma',
@@ -629,7 +676,7 @@ const useStore = defineStore('store', {
           geoRaster.ymin = south;
           geoRaster.xmax = east;
           geoRaster.ymax = north;
-          
+
           geoRaster.pixelHeight = (north - south) / geoRaster.height;
           geoRaster.pixelWidth = (east - west) / geoRaster.width;
           console.log('New GeoRaster resolution:', {
@@ -697,13 +744,40 @@ const useStore = defineStore('store', {
               },
               simulation: {
                 ...defaultParams.simulation,
-                max_dbm: flatParams.max_dbm || (defaultParams.simulation as any).max_dbm || -80,
-                min_dbm: flatParams.min_dbm || (defaultParams.simulation as any).min_dbm || -130,
                 simulation_extent: flatParams.radius || defaultParams.simulation.simulation_extent,
                 high_resolution: flatParams.high_resolution || defaultParams.simulation.high_resolution,
+              },
+              display: {
+                ...defaultParams.display,
+                max_dbm: flatParams.max_dbm || (defaultParams.display as any).max_dbm || -80,
+                min_dbm: flatParams.min_dbm || (defaultParams.display as any).min_dbm || -130,
               }
             };
           }
+        }
+
+        // Reconstruct GeoJSON for the transmitter
+        let geojsonData: any = undefined;
+        if (finalParams && finalParams.transmitter) {
+          geojsonData = {
+            "type": "FeatureCollection",
+            "features": [
+              {
+                "type": "Feature",
+                "geometry": {
+                  "type": "Point",
+                  "coordinates": [finalParams.transmitter.tx_lon, finalParams.transmitter.tx_lat]
+                },
+                "properties": {
+                  "name": finalParams.transmitter.name || "Transmitter",
+                  "type": "transmitter",
+                  "height": finalParams.transmitter.tx_height,
+                  "power": finalParams.transmitter.tx_power,
+                  "gain": finalParams.transmitter.tx_gain
+                }
+              }
+            ]
+          };
         }
 
         const buildPngDataUrl = (raster: any): string | null => {
@@ -744,18 +818,21 @@ const useStore = defineStore('store', {
         const imageUrl = buildPngDataUrl(geoRaster);
         const opacityFromParams = (finalParams.display?.overlay_transparency ?? 50) / 100;
 
+        const siteId = (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+          ? crypto.randomUUID()
+          : `import-${Date.now()}-${Math.random()}`;
+
         this.localSites.push({
-          id: this.localSites.length,
-          lat: finalParams.transmitter.tx_lat,
-          lon: finalParams.transmitter.tx_lon,
-          radius: finalParams.simulation.simulation_extent,
+          id: siteId,
+          taskId: (metadata as any)?.taskId || siteId,
           raster: geoRaster,
           bounds: leafletBounds,
           visible: true,
           params: finalParams,
           imageUrl: imageUrl || undefined,
           opacity: opacityFromParams,
-          rawBuffer: bufferForStorage
+          rawBuffer: bufferForStorage,
+          geojson: geojsonData
         } as any);
 
         this.redrawSites();

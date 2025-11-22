@@ -1,3 +1,4 @@
+import atexit
 import gzip
 import logging
 import math
@@ -7,22 +8,34 @@ import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from typing import Literal, List, Tuple
-from rasterio.transform import Affine
+import concurrent.futures
+import time
 
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from diskcache import Cache
 
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
-from PIL import Image
+from rasterio.warp import calculate_default_transform, reproject, Resampling as WarpResampling
+from rasterio import Affine
+from PIL import Image, ImageDraw
+import json
 
 from app.models.CoveragePredictionRequest import CoveragePredictionRequest
+from diskcache import Cache
+
+# Worker-process singletons to avoid reinitializing expensive resources
+_worker_cache = None
+_worker_s3 = None
+_worker_bucket_name = ""
+_worker_bucket_prefix = ""
+_worker_srtm2sdf_binary = ""
+_worker_srtm2sdf_hd_binary = ""
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +45,19 @@ logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+def _tile_worker_initializer(cache_dir: str, bucket_name: str, bucket_prefix: str, srtm2sdf_binary: str, srtm2sdf_hd_binary: str) -> None:
+    """
+    Pre-warm worker processes with shared resources so we don't pay setup cost per tile.
+    """
+    global _worker_cache, _worker_s3, _worker_bucket_name, _worker_bucket_prefix, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary
+    _worker_cache = Cache(cache_dir)
+    _worker_s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    _worker_bucket_name = bucket_name
+    _worker_bucket_prefix = bucket_prefix
+    _worker_srtm2sdf_binary = srtm2sdf_binary
+    _worker_srtm2sdf_hd_binary = srtm2sdf_hd_binary
+
+
 class Splat:
     def __init__(
         self,
@@ -39,7 +65,8 @@ class Splat:
         cache_dir: str = ".splat_tiles",
         cache_size_gb: float = 1.0,
         bucket_name: str = "elevation-tiles-prod",
-        bucket_prefix:str = "v2/skadi"
+        bucket_prefix:str = "v2/skadi",
+        tile_workers: int | None = None,
     ):
         """
         SPLAT! wrapper class. Provides methods for generating SPLAT! RF coverage maps in GeoTIFF format.
@@ -62,6 +89,8 @@ class Splat:
                 open data bucket `elevation-tiles-prod`.
             bucket_prefix (str): Folder in the S3 bucket containing the terrain tiles. Defaults to
                 `v2/skadi`, which contains 1-arcsecond terrain data for most of the world.
+            tile_workers (int | None): Number of worker processes to use for tile download/convert.
+                Defaults to the number of CPUs. Kept long-lived to avoid spin-up cost per request.
         """
 
         # Check the provided SPLAT! path exists
@@ -115,9 +144,16 @@ class Splat:
         self.s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
         self.bucket_name = bucket_name
         self.bucket_prefix = bucket_prefix
+        self.tile_workers = tile_workers or os.cpu_count() or 1
+        self._tile_executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.tile_workers,
+            initializer=_tile_worker_initializer,
+            initargs=(cache_dir, bucket_name, bucket_prefix, self.srtm2sdf_binary, self.srtm2sdf_hd_binary),
+        )
+        atexit.register(self._tile_executor.shutdown, wait=False)
 
         logger.info(
-            f"Initialized SPLAT! with terrain tile cache at '{cache_dir}' with a size limit of {cache_size_gb} GB."
+            f"Initialized SPLAT! with terrain tile cache at '{cache_dir}' with a size limit of {cache_size_gb} GB using {self.tile_workers} worker(s)."
         )
 
     def coverage_prediction(self, request: CoveragePredictionRequest) -> bytes:
@@ -128,10 +164,11 @@ class Splat:
             request (CoveragePredictionRequest): The coverage prediction request object.
 
         Returns:
-            Tuple[bytes, bytes, Tuple[float, float, float, float]]: 
+            Tuple[bytes, bytes, Tuple[float, float, float, float]]:
                 - GeoTIFF bytes
                 - PNG bytes
                 - Bounds (north, south, east, west)
+                - GeoJSON bytes
 
         Raises:
             RuntimeError: If SPLAT! fails to execute.
@@ -155,12 +192,33 @@ class Splat:
                 required_tiles = Splat._calculate_required_terrain_tiles(request.lat, request.lon, request.radius)
 
                 # download and convert terrain tiles to SPLAT! sdf
-                for tile_name, sdf_name, sdf_hd_name in required_tiles:
-                    tile_data = self._download_terrain_tile(tile_name)
-                    sdf_data = self._convert_hgt_to_sdf(tile_data, tile_name, high_resolution=request.high_resolution)
+                start_time = time.time()
 
-                    with open(os.path.join(tmpdir, sdf_hd_name if request.high_resolution else sdf_name), "wb") as sdf_file:
-                        sdf_file.write(sdf_data)
+                # Use ProcessPoolExecutor for true parallelism (CPU bound tasks)
+                # We need to pass the cache directory to the worker so it can open its own cache connection
+                future_to_tile = {
+                    self._tile_executor.submit(
+                        process_tile_worker,
+                        tile_name,
+                        request.high_resolution,
+                    ): (tile_name, sdf_name, sdf_hd_name)
+                    for tile_name, sdf_name, sdf_hd_name in required_tiles
+                }
+
+                for future in concurrent.futures.as_completed(future_to_tile):
+                    tile_info = future_to_tile[future]
+                    try:
+                        sdf_filename, sdf_data = future.result()
+                        with open(os.path.join(tmpdir, sdf_filename), "wb") as sdf_file:
+                            sdf_file.write(sdf_data)
+                    except Exception as e:
+                        logger.error(f"Failed to process tile {tile_info[0]}: {e}")
+                        raise
+
+                tile_prep_time = time.time() - start_time
+                logger.info(f"Tile preparation took {tile_prep_time:.2f} seconds")
+
+                # write transmitter / qth file
 
                 # write transmitter / qth file
                 with open(os.path.join(tmpdir, "tx.qth"), "wb") as qth_file:
@@ -219,6 +277,7 @@ class Splat:
                 ] # flag "olditm" uses the standard ITM model instead of ITWOM, which has produced unrealistic results.
                 logger.debug(f"Executing SPLAT! command: {' '.join(splat_command)}")
 
+                splat_start_time = time.time()
                 splat_result = subprocess.run(
                     splat_command,
                     cwd=tmpdir,
@@ -226,6 +285,8 @@ class Splat:
                     text=True,
                     check=False,
                 )
+                splat_duration = time.time() - splat_start_time
+                logger.info(f"SPLAT! execution took {splat_duration:.2f} seconds")
 
                 logger.debug(f"SPLAT! stdout:\n{splat_result.stdout}")
                 logger.debug(f"SPLAT! stderr:\n{splat_result.stderr}")
@@ -243,17 +304,14 @@ class Splat:
                     with open(os.path.join(tmpdir, "output.kml"), "rb") as kml_file:
                         ppm_data = ppm_file.read()
                         kml_data = kml_file.read()
-                        geotiff_data, png_data, bounds = Splat._create_splat_geotiff(
+                        geotiff_data, png_data, bounds, geojson_data = Splat._create_splat_geotiff(
                             ppm_bytes=ppm_data,
                             kml_bytes=kml_data,
-                            colormap_name=request.colormap,
-                            min_dbm=request.min_dbm,
-                            max_dbm=request.max_dbm,
                             metadata={"MESHTASTIC_PARAMS": request.model_dump_json()}
                         )
 
                 logger.info("SPLAT! coverage prediction completed successfully.")
-                return geotiff_data, png_data, bounds
+                return geotiff_data, png_data, bounds, geojson_data
 
             except Exception as e:
                 logger.error(f"Error during coverage prediction: {e}")
@@ -511,9 +569,6 @@ class Splat:
     def _create_splat_geotiff(
             ppm_bytes: bytes,
             kml_bytes: bytes,
-            colormap_name: str,
-            min_dbm: float,
-            max_dbm: float,
             null_value: int = 0,  # Define the null value for transparency
             metadata: dict = None
     ) -> bytes:
@@ -523,11 +578,7 @@ class Splat:
         Args:
             ppm_bytes (bytes): Binary content of the SPLAT-generated PPM file.
             kml_bytes (bytes): Binary content of the KML file containing geospatial bounds.
-            colormap_name (str): Name of the matplotlib colormap to use for the GeoTIFF.
-            min_dbm (float): Minimum dBm value for the colormap scale.
-            max_dbm (float): Maximum dBm value for the colormap scale.
-            min_dbm (float): Minimum dBm value for the colormap scale.
-            max_dbm (float): Maximum dBm value for the colormap scale.
+            null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
             null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
 
         Returns:
@@ -552,6 +603,12 @@ class Splat:
             south = float(box.find("kml:south", namespace).text)
             east = float(box.find("kml:east", namespace).text)
             west = float(box.find("kml:west", namespace).text)
+            tx_metadata = None
+            if metadata and "MESHTASTIC_PARAMS" in metadata:
+                try:
+                    tx_metadata = json.loads(metadata["MESHTASTIC_PARAMS"])
+                except Exception as e:
+                    logger.warning(f"Failed to parse transmitter metadata: {e}")
 
             # CRITICAL FIX: SPLAT! KML output often reports the north bound as the center of the top pixel
             # or excludes the last pixel height, resulting in a 1-pixel Y-axis shift (approx 90m).
@@ -559,23 +616,57 @@ class Splat:
             # Resolution x = (east - west) / width
             # Resolution y = Resolution x (square pixels)
             # North = South + (Height * Resolution y)
-            
+
             # Read PPM content first to get dimensions
             logger.debug("Reading PPM content.")
             with Image.open(io.BytesIO(ppm_bytes)) as img:
                 # Convert to RGBA directly
                 img_rgba = img.convert("RGBA")
+                width, height = img_rgba.size
+
+                # Calculate resolution from X axis (reliable)
+                res_x = (east - west) / width
+
+                # Recalculate North bound
+                original_north = north
+                north = south + (height * res_x)
+
+                # Draw transmitter location if metadata is available
+                if tx_metadata:
+                    try:
+                        tx_lat = tx_metadata.get("lat")
+                        tx_lon = tx_metadata.get("lon")
+
+                        if tx_lat is not None and tx_lon is not None:
+                            draw = ImageDraw.Draw(img_rgba)
+
+                            # Calculate pixel coordinates
+                            # x = (lon - west) / (east - west) * width
+                            # y = (north - lat) / (north - south) * height
+                            # Note: Y axis is inverted (0 is top), north is top latitude
+
+                            if east != west and north != south:
+                                x = (tx_lon - west) / (east - west) * width
+                                y = (north - tx_lat) / (north - south) * height
+
+                                # Draw red triangle with white outline
+                                size = 2.5
+                                points = [
+                                    (x, y - size),          # Top
+                                    (x - size, y + size),   # Bottom Left
+                                    (x + size, y + size)    # Bottom Right
+                                ]
+                                draw.polygon(points, fill="red", outline="white")
+                                logger.info(f"Drew transmitter at ({x:.1f}, {y:.1f}) for lat/lon ({tx_lat}, {tx_lon})")
+                    except Exception as e:
+                        logger.warning(f"Failed to draw transmitter location: {e}")
+
                 img_array = np.array(img_rgba)
-            
-            height, width, channels = img_array.shape
-            
-            # Calculate resolution from X axis (reliable)
-            res_x = (east - west) / width
-            
-            # Recalculate North bound
-            original_north = north
-            north = south + (height * res_x)
-            
+
+            # height, width already obtained from img_rgba.size
+            # res_x already calculated
+            # north already recalculated
+
             logger.info(
                 f"Extracted bounding box: north={original_north}, south={south}, east={east}, west={west}"
             )
@@ -584,14 +675,7 @@ class Splat:
             )
 
 
-            # Log unique colors to debug transparency
-            unique_colors, counts = np.unique(img_array.reshape(-1, 4), axis=0, return_counts=True)
-            # Sort by count descending
-            sorted_indices = np.argsort(-counts)
-            top_colors = unique_colors[sorted_indices[:5]]
-            top_counts = counts[sorted_indices[:5]]
-            logger.info(f"Top 5 colors in image (RGBA): {top_colors}")
-            logger.info(f"Top 5 counts: {top_counts}")
+
 
             # Mask black pixels (near 0,0,0) to be transparent
             # Using a small tolerance of 10 to catch compression artifacts or near-black colors
@@ -603,59 +687,96 @@ class Splat:
             white_pixels = (img_array[:, :, 0] > 245) & (img_array[:, :, 1] > 245) & (img_array[:, :, 2] > 245)
             img_array[white_pixels] = [0, 0, 0, 0]
 
-            # Log unique colors AFTER masking
-            unique_colors_post, counts_post = np.unique(img_array.reshape(-1, 4), axis=0, return_counts=True)
-            sorted_indices_post = np.argsort(-counts_post)
-            top_colors_post = unique_colors_post[sorted_indices_post[:5]]
-            top_counts_post = counts_post[sorted_indices_post[:5]]
-            logger.info(f"Top 5 colors AFTER masking (RGBA): {top_colors_post}")
-            logger.info(f"Top 5 counts AFTER masking: {top_counts_post}")
+
 
             # Create GeoTIFF using Rasterio
             height, width, channels = img_array.shape
             transform = from_bounds(west, south, east, north, width, height)
             logger.debug(f"GeoTIFF transform matrix: {transform}")
 
-            # Write GeoTIFF to memory
-            with io.BytesIO() as buffer:
-                with rasterio.open(
-                        buffer,
-                        "w",
-                        driver="GTiff",
-                        height=height,
-                        width=width,
-                        count=4,  # RGBA
-                        dtype="uint8",
-                        crs="EPSG:4326",
-                        transform=transform,
-                        compress="lzw",
-                ) as dst:
-                    # Move channels to first dimension (H, W, 4) -> (4, H, W)
-                    data = np.moveaxis(img_array, -1, 0)
-                    dst.write(data)
-                    
-                    # Store metadata in ImageDescription tag for easy browser reading
-                    if metadata:
-                        import json
-                        # Add bounds to metadata for precise restoration
-                        metadata["BOUNDS"] = [north, south, east, west]
-                        metadata_json = json.dumps(metadata)
-                        logger.info(f"Writing metadata to TIFF: {metadata_json[:200]}...")
-                        dst.update_tags(ImageDescription=metadata_json)
+            def generate_geotiff():
+                # Write GeoTIFF to memory
+                with io.BytesIO() as buffer:
+                    with rasterio.open(
+                            buffer,
+                            "w",
+                            driver="GTiff",
+                            height=height,
+                            width=width,
+                            count=4,  # RGBA
+                            dtype="uint8",
+                            crs="EPSG:4326",
+                            transform=transform,
+                            compress="lzw",
+                    ) as dst:
+                        # Move channels to first dimension (H, W, 4) -> (4, H, W)
+                        data = np.moveaxis(img_array, -1, 0)
+                        dst.write(data)
 
-                buffer.seek(0)
-                geotiff_bytes = buffer.read()
+                        # Store metadata in ImageDescription tag for easy browser reading
+                        if metadata:
+                            # Add bounds to metadata for precise restoration
+                            metadata["BOUNDS"] = [north, south, east, west]
+                            metadata_json = json.dumps(metadata)
+                            logger.info(f"Writing metadata to TIFF: {metadata_json[:200]}...")
+                            dst.update_tags(ImageDescription=metadata_json)
 
-            # Write PNG to memory
-            with io.BytesIO() as png_buffer:
-                # Convert array back to image for saving as PNG
-                # img_array is (H, W, 4)
-                img_png = Image.fromarray(img_array, 'RGBA')
-                img_png.save(png_buffer, format="PNG")
-                png_bytes = png_buffer.getvalue()
+                    buffer.seek(0)
+                    return buffer.read()
+
+            def generate_png():
+                # Write PNG to memory
+                with io.BytesIO() as png_buffer:
+                    # Convert array back to image for saving as PNG
+                    # img_array is (H, W, 4)
+                    img_png = Image.fromarray(img_array, 'RGBA')
+                    img_png.save(png_buffer, format="PNG")
+                    return png_buffer.getvalue()
+
+            # Run generation in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_geotiff = executor.submit(generate_geotiff)
+                future_png = executor.submit(generate_png)
+                
+                geotiff_bytes = future_geotiff.result()
+                png_bytes = future_png.result()
 
             logger.info("GeoTIFF and PNG generation successful.")
-            return geotiff_bytes, png_bytes, (north, south, east, west)
+
+            # Generate GeoJSON for the transmitter
+            geojson_bytes = b"{}"
+            if tx_metadata:
+                try:
+                    tx_lat = tx_metadata.get("lat")
+                    tx_lon = tx_metadata.get("lon")
+                    name = "Transmitter" # Default name
+
+                    # Create GeoJSON FeatureCollection
+                    geojson_obj = {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [tx_lon, tx_lat]
+                                },
+                                "properties": {
+                                    "name": name,
+                                    "type": "transmitter",
+                                    "height": tx_metadata.get("tx_height"),
+                                    "power": tx_metadata.get("tx_power"),
+                                    "gain": tx_metadata.get("tx_gain")
+                                }
+                            }
+                        ]
+                    }
+                    geojson_bytes = json.dumps(geojson_obj).encode('utf-8')
+                    logger.info(f"Generated GeoJSON: {geojson_bytes[:100]}...")
+                except Exception as e:
+                    logger.warning(f"Failed to generate GeoJSON: {e}")
+
+            return geotiff_bytes, png_bytes, (north, south, east, west), geojson_bytes
 
         except Exception as e:
             logger.error(f"Error during GeoTIFF generation: {e}")
@@ -717,7 +838,8 @@ class Splat:
             max_lon = 0 if min_lon == 359 else min_lon + 1
             return f"{lat}:{lat + 1}:{min_lon}:{max_lon}{'-hd.sdf' if high_resolution else '.sdf'}"
 
-    def _convert_hgt_to_sdf(self, tile: bytes, tile_name: str, high_resolution: bool = False) -> bytes:
+    @staticmethod
+    def _convert_hgt_to_sdf(tile: bytes, tile_name: str, tile_cache: Cache, high_resolution: bool = False, srtm2sdf_binary: str = "", srtm2sdf_hd_binary: str = "") -> bytes:
         """
         Converts a .hgt.gz terrain tile (provided as bytes) to a SPLAT! .sdf or -hd.sdf file.
 
@@ -729,7 +851,10 @@ class Splat:
         Args:
             tile (bytes): The binary content of the .hgt.gz terrain tile.
             tile_name (str): The name of the terrain tile (e.g., N35W120.hgt.gz).
+            tile_cache (Cache): The cache object to use for storing converted SDF files.
             high_resolution (bool): Whether to generate a high-resolution -hd.sdf file. Defaults to False.
+            srtm2sdf_binary (str): Path to the srtm2sdf binary.
+            srtm2sdf_hd_binary (str): Path to the srtm2sdf-hd binary.
 
         Returns:
             bytes: The binary content of the converted .sdf or -hd.sdf file.
@@ -741,9 +866,9 @@ class Splat:
         sdf_filename = Splat._hgt_filename_to_sdf_filename(tile_name, high_resolution)
 
         # Check cache for converted file
-        if sdf_filename in self.tile_cache:
+        if sdf_filename in tile_cache:
             logger.info(f"Cache hit: {sdf_filename} found in the local cache.")
-            return self.tile_cache[sdf_filename]
+            return tile_cache[sdf_filename]
 
         # Create temporary working directory
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -795,8 +920,9 @@ class Splat:
                         raise RuntimeError(f"Downsampling error for {hgt_path}: {e}")
 
                 # Call srtm2sdf or srtm2sdf-hd in the temporary directory
-                cmd = self.srtm2sdf_hd_binary if high_resolution else self.srtm2sdf_binary
+                cmd = srtm2sdf_hd_binary if high_resolution else srtm2sdf_binary
                 logger.info(f"Converting {hgt_path} to {sdf_filename} using {cmd}.")
+                splat_start_time = time.time()
                 result = subprocess.run(
                     [cmd, os.path.basename(tile_name.replace(".gz", ""))],
                     cwd=tmpdir,
@@ -804,6 +930,8 @@ class Splat:
                     text=True,
                     check=True,
                 )
+                splat_duration = time.time() - splat_start_time
+                logger.info(f"srtm2sdf execution took {splat_duration:.2f} seconds")
 
                 logger.debug(f"srtm2sdf output:\n{result.stderr}")
                 sdf_path = os.path.join(tmpdir, sdf_filename)
@@ -816,7 +944,7 @@ class Splat:
                 # Read and cache the .sdf file
                 with open(sdf_path, "rb") as sdf_file:
                     sdf_data = sdf_file.read()
-                self.tile_cache[sdf_filename] = sdf_data
+                tile_cache[sdf_filename] = sdf_data
 
                 logger.info(f"Successfully converted and cached {sdf_filename}.")
                 return sdf_data
@@ -832,6 +960,45 @@ class Splat:
 
 
 
+def process_tile_worker(tile_name: str, high_resolution: bool) -> Tuple[str, bytes]:
+    """
+    Worker function for processing tiles in a separate process.
+    """
+    try:
+        global _worker_cache, _worker_s3, _worker_bucket_name, _worker_bucket_prefix, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary
+        if _worker_cache is None or _worker_s3 is None:
+            raise RuntimeError("Worker context not initialized")
+
+        # Check cache first (to avoid S3 download if possible)
+        sdf_filename = Splat._hgt_filename_to_sdf_filename(tile_name, high_resolution)
+        if sdf_filename in _worker_cache:
+            return sdf_filename, _worker_cache[sdf_filename]
+
+        # Download
+        tile_dir_prefix = tile_name[:3]
+        s3_key = f"{_worker_bucket_prefix}/{tile_dir_prefix}/{tile_name}"
+
+        try:
+            obj = _worker_s3.get_object(Bucket=_worker_bucket_name, Key=s3_key)
+            tile_data = obj['Body'].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                # Fallback logic
+                s3_key = f"skadi/{tile_dir_prefix}/{tile_name}"
+                obj = _worker_s3.get_object(Bucket=_worker_bucket_name, Key=s3_key)
+                tile_data = obj["Body"].read()
+            else:
+                raise
+
+        # Convert
+        sdf_data = Splat._convert_hgt_to_sdf(tile_data, tile_name, _worker_cache, high_resolution, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary)
+
+        return sdf_filename, sdf_data
+        
+    except Exception as e:
+        # logger is not pickleable, so we print to stderr which docker captures
+        print(f"Worker failed for {tile_name}: {e}")
+        raise
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG)

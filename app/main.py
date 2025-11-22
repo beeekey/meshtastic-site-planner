@@ -62,13 +62,14 @@ def run_splat(task_id: str, request: CoveragePredictionRequest):
     """
     try:
         logger.info(f"Starting SPLAT! coverage prediction for task {task_id}.")
-        geotiff_data, png_data, bounds = splat_service.coverage_prediction(request)
+        geotiff_data, png_data, bounds, geojson_data = splat_service.coverage_prediction(request)
 
         # Log before storing in Redis
         logger.info(f"Storing result in Redis for task {task_id}")
         redis_client.setex(task_id, 3600, geotiff_data)
         redis_client.setex(f"{task_id}:png", 3600, png_data)
         redis_client.setex(f"{task_id}:bounds", 3600, json.dumps(bounds))
+        redis_client.setex(f"{task_id}:geojson", 3600, geojson_data)
         # Store metadata separately for easy retrieval
         redis_client.setex(f"{task_id}:metadata", 3600, request.model_dump_json())
         
@@ -196,6 +197,28 @@ async def get_result_png(task_id: str):
             png_file,
             media_type="image/png"
         )
+    elif status == "failed":
+        error = redis_client.get(f"{task_id}:error")
+        return JSONResponse({"status": "failed", "error": error.decode("utf-8")})
+
+    return JSONResponse({"status": "processing"})
+
+@app.get("/result/{task_id}/geojson")
+async def get_result_geojson(task_id: str):
+    """
+    Retrieve SPLAT! task result as GeoJSON.
+    """
+    status = redis_client.get(f"{task_id}:status")
+    if not status:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+
+    status = status.decode("utf-8")
+    if status == "completed":
+        geojson_data = redis_client.get(f"{task_id}:geojson")
+        if not geojson_data:
+            return JSONResponse({"error": "No GeoJSON result found"}, status_code=500)
+
+        return JSONResponse(json.loads(geojson_data.decode("utf-8")))
     elif status == "failed":
         error = redis_client.get(f"{task_id}:error")
         return JSONResponse({"status": "failed", "error": error.decode("utf-8")})

@@ -14,3 +14,9 @@ body {
 .spinner-border-sm {
     margin-right: 0.5rem; /* Optional: Add spacing between spinner and text */
 }
+
+/* Ensure pixelated rendering for simulation overlays */
+.pixelated-overlay {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
