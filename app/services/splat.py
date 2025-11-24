@@ -23,6 +23,8 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import calculate_default_transform, reproject, Resampling as WarpResampling
 from rasterio import Affine
+from rasterio.io import MemoryFile
+from rasterio.shutil import copy
 from PIL import Image, ImageDraw
 import json
 
@@ -573,19 +575,20 @@ class Splat:
             metadata: dict = None
     ) -> bytes:
         """
-        Generate GeoTIFF file content from SPLAT! PPM and KML data, with transparency for null areas.
+        Generate Cloud Optimized GeoTIFF (COG) file content from SPLAT! PPM and KML data.
 
         Args:
             ppm_bytes (bytes): Binary content of the SPLAT-generated PPM file.
             kml_bytes (bytes): Binary content of the KML file containing geospatial bounds.
             null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
-            null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
+            metadata (dict): Optional metadata to embed in the GeoTIFF.
 
         Returns:
             Tuple[bytes, bytes, Tuple[float, float, float, float]]:
-                - GeoTIFF bytes
+                - GeoTIFF bytes (COG format)
                 - PNG bytes
                 - Bounds (north, south, east, west)
+                - GeoJSON bytes
 
         Raises:
             RuntimeError: If the conversion process fails.
@@ -674,9 +677,6 @@ class Splat:
                 f"Recalculated North bound: {north} (Diff: {north - original_north:.6f} deg)"
             )
 
-
-
-
             # Mask black pixels (near 0,0,0) to be transparent
             # Using a small tolerance of 10 to catch compression artifacts or near-black colors
             black_pixels = (img_array[:, :, 0] < 10) & (img_array[:, :, 1] < 10) & (img_array[:, :, 2] < 10)
@@ -687,19 +687,15 @@ class Splat:
             white_pixels = (img_array[:, :, 0] > 245) & (img_array[:, :, 1] > 245) & (img_array[:, :, 2] > 245)
             img_array[white_pixels] = [0, 0, 0, 0]
 
-
-
             # Create GeoTIFF using Rasterio
             height, width, channels = img_array.shape
             transform = from_bounds(west, south, east, north, width, height)
             logger.debug(f"GeoTIFF transform matrix: {transform}")
 
             def generate_geotiff():
-                # Write GeoTIFF to memory
-                with io.BytesIO() as buffer:
-                    with rasterio.open(
-                            buffer,
-                            "w",
+                # Write GeoTIFF to memory first
+                with MemoryFile() as memfile:
+                    with memfile.open(
                             driver="GTiff",
                             height=height,
                             width=width,
@@ -707,7 +703,6 @@ class Splat:
                             dtype="uint8",
                             crs="EPSG:4326",
                             transform=transform,
-                            compress="lzw",
                     ) as dst:
                         # Move channels to first dimension (H, W, 4) -> (4, H, W)
                         data = np.moveaxis(img_array, -1, 0)
@@ -720,9 +715,30 @@ class Splat:
                             metadata_json = json.dumps(metadata)
                             logger.info(f"Writing metadata to TIFF: {metadata_json[:200]}...")
                             dst.update_tags(ImageDescription=metadata_json)
+                        
+                        # Build overviews for COG
+                        # Only if image is large enough to warrant them
+                        if width > 512 or height > 512:
+                            overviews = [2 ** j for j in range(1, 4)]
+                            dst.build_overviews(overviews, Resampling.average)
+                            dst.update_tags(ns='rio_overview', resampling='average')
 
-                    buffer.seek(0)
-                    return buffer.read()
+                    # Copy to COG structure
+                    with memfile.open() as src:
+                        with MemoryFile() as cog_memfile:
+                            copy(
+                                src,
+                                cog_memfile.name,
+                                driver="GTiff",
+                                copy_src_overviews=True,
+                                compress="deflate",
+                                tiled=True,
+                                blockxsize=256,
+                                blockysize=256,
+                                interleave="pixel",
+                                predictor=2 # Horizontal differencing for better compression
+                            )
+                            return cog_memfile.read()
 
             def generate_png():
                 # Write PNG to memory
