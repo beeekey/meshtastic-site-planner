@@ -8,10 +8,41 @@ import { type Site, type SplatParams } from './types.ts';
 import { cloneObject } from './utils.ts';
 import { redPinMarker } from './layers.ts';
 
+// Defensive guard: ignore grid layer zoom callbacks if Leaflet fires them after the layer was removed.
+const gridLayerProto: any = (L as any).GridLayer?.prototype;
+if (gridLayerProto && !gridLayerProto.__resetViewGuarded) {
+  const originalResetView = gridLayerProto._resetView;
+  gridLayerProto._resetView = function (e: any) {
+    if (!this._map) return;
+    return originalResetView.call(this, e);
+  };
+  gridLayerProto.__resetViewGuarded = true;
+}
+
+// Remove any map event handlers still bound to a layer before discarding it.
+const detachLayerEvents = (map: L.Map, layer: any) => {
+  if (typeof layer?.getEvents === 'function') {
+    try {
+      const events = layer.getEvents();
+      for (const type of Object.keys(events || {})) {
+        const handler = (events as any)[type];
+        if (typeof handler === 'function') {
+          map.off(type as any, handler, layer);
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to detach map events for layer', err);
+    }
+  }
+};
+
 const useStore = defineStore('store', {
   state() {
     return {
       map: undefined as undefined | L.Map,
+      mapAnimating: false,
+      pendingRedraw: false,
+      redrawTimeoutId: undefined as number | undefined,
       siteLayers: [] as any[],
       currentMarker: undefined as undefined | L.Marker,
       localSites: [] as Site[], //useLocalStorage('localSites', ),
@@ -64,7 +95,7 @@ const useStore = defineStore('store', {
       this.splatParams.transmitter.tx_lat = lat
       this.splatParams.transmitter.tx_lon = lon
       console.log('Transmitter coordinates updated:', lat, lon)
-      if (this.map) {
+      if (this.map && this.map.getCenter) {
         this.map.setView([lat, lon], this.map.getZoom())
       }
     },
@@ -81,12 +112,38 @@ const useStore = defineStore('store', {
       this.redrawSites();
     },
     redrawSites() {
-      if (!this.map) {
+      if (!this.map || typeof this.map.getCenter !== 'function') {
         return;
       }
 
+      const mapAny = this.map as any;
+      const zoomAnimating = this.mapAnimating || !!mapAny?._animatingZoom;
+      const panAnimating = !!(mapAny?._panAnim && mapAny._panAnim._inProgress);
+
+      if (zoomAnimating || panAnimating) {
+        this.pendingRedraw = true;
+        if (!this.redrawTimeoutId) {
+          this.redrawTimeoutId = window.setTimeout(() => {
+            this.redrawTimeoutId = undefined;
+            this.redrawSites();
+          }, 100);
+        }
+        return;
+      }
+
+      this.pendingRedraw = false;
+      if (this.redrawTimeoutId) {
+        clearTimeout(this.redrawTimeoutId);
+        this.redrawTimeoutId = undefined;
+      }
+
+      // Stop any in-flight pan/zoom animations before mutating layers
+      if (typeof this.map.stop === 'function') {
+        this.map.stop();
+      }
+
       // Check if map is in a valid state (has CRS)
-      if (!this.map.options.crs) {
+      if (!this.map.options || !this.map.options.crs) {
         console.warn('Map CRS not initialized, skipping redraw');
         return;
       }
@@ -97,7 +154,12 @@ const useStore = defineStore('store', {
       // Remove all previously tracked layers
       this.siteLayers.forEach(layer => {
         try {
-          this.map!.removeLayer(layer);
+          if (this.map) {
+            detachLayerEvents(this.map, layer);
+            if (this.map.hasLayer(layer)) {
+              this.map.removeLayer(layer);
+            }
+          }
         } catch (e) {
           console.warn('Error removing layer:', e);
         }
@@ -214,6 +276,7 @@ const useStore = defineStore('store', {
           this.siteLayers.push(geoJsonLayer);
         }
       });
+
     },
     initMap() {
       // Guard against re-initialization
@@ -226,31 +289,51 @@ const useStore = defineStore('store', {
         center: [46.8182, 8.2275],
         zoom: 8,
         zoomControl: false,
+        zoomAnimation: false,
+        zoomAnimationThreshold: 0,
+        fadeAnimation: false,
+        markerZoomAnimation: false,
       });
       const position: [number, number] = [this.splatParams.transmitter.tx_lat, this.splatParams.transmitter.tx_lon];
       this.map.setView(position, 10);
 
       L.control.zoom({ position: "bottomleft" }).addTo(this.map as L.Map);
 
+      this.map.on('layerremove', (evt: L.LayerEvent) => {
+        if (!this.map) return;
+        detachLayerEvents(this.map, evt.layer);
+      });
+
+      const commonTileOptions = {
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+        keepBuffer: 3,
+      } as const;
+
       const cartoLight = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
         attribution: '© OpenStreetMap contributors © CARTO',
+        ...commonTileOptions,
       });
 
       const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap contributors',
+        ...commonTileOptions,
       })
 
       const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
         attribution: 'Tiles © Esri — Source: Esri, USGS, NOAA',
+        ...commonTileOptions,
       });
 
       const topoLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
         attribution: 'Map data: © OpenStreetMap contributors, SRTM | OpenTopoMap',
+        ...commonTileOptions,
       });
 
       const topPlusGrey = L.tileLayer('https://sgx.geodatenzentrum.de/wmts_topplus_open/tile/1.0.0/web_grau/default/WEBMERCATOR/{z}/{y}/{x}.png', {
         maxZoom: 18,
-        attribution: 'Map data: &copy; <a href="http://www.govdata.de/dl-de/by-2-0">dl-de/by-2-0</a>'
+        attribution: 'Map data: &copy; <a href="http://www.govdata.de/dl-de/by-2-0">dl-de/by-2-0</a>',
+        ...commonTileOptions,
       });
 
       topPlusGrey.addTo(this.map as L.Map);
@@ -270,9 +353,38 @@ const useStore = defineStore('store', {
         position: "bottomleft",
       }).addTo(this.map as L.Map);
 
-      this.map.on("baselayerchange", () => {
-        this.redrawSites(); // Re-apply the GeoRasterLayer on top
+      this.map.on("baselayerchange", (e: L.LayersControlEvent) => {
+        if (!this.map) return;
+        const newBaseLayer = e.layer;
+        
+        const doRedraw = () => {
+          if (!this.map) return;
+          this.redrawSites();
+        };
+
+        // For tile layers, the 'load' event tells us when it's safe to redraw.
+        if (newBaseLayer && typeof (newBaseLayer as any).once === 'function') {
+          (newBaseLayer as any).once('load', doRedraw);
+        } else {
+          // For non-tile layers or as a fallback, use a timeout.
+          // This is less reliable but better than nothing.
+          setTimeout(doRedraw, 500);
+        }
       });
+
+      this.map.on('zoomstart', () => {
+        this.mapAnimating = true;
+      });
+
+      const handleMapStable = () => {
+        this.mapAnimating = false;
+        if (this.pendingRedraw) {
+          this.redrawSites();
+        }
+      };
+
+      this.map.on('zoomend', handleMapStable);
+      this.map.on('moveend', handleMapStable);
 
       this.map.on("click", (e: L.LeafletMouseEvent) => {
         const { lat, lng } = e.latlng;
