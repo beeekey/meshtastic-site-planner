@@ -3,6 +3,10 @@
     <form novalidate>
         <div class="row g-2">
             <div class="col-12">
+                <label for="nickname" class="form-label">Site Nickname</label>
+                <input v-model="transmitter.nickname" class="form-control form-control-sm" id="nickname" placeholder="e.g. Home, Office" data-bs-toggle="tooltip" title="Optional nickname to prepend to the site name" />
+            </div>
+            <div class="col-12">
                 <label for="name" class="form-label">Site name</label>
                 <input v-model="transmitter.name" class="form-control form-control-sm" id="name" required data-bs-toggle="tooltip" title="Site Name" />
             </div>

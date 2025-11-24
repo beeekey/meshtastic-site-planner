@@ -20,6 +20,7 @@ const useStore = defineStore('store', {
       splatParams: <SplatParams>{
         transmitter: {
           name: randanimalSync(),
+          nickname: '',
           tx_lat: 46.8182,
           tx_lon: 8.2275,
           tx_power: 0.1,
@@ -52,7 +53,8 @@ const useStore = defineStore('store', {
           color_scale: 'plasma',
           min_dbm: -130.0,
           max_dbm: -80.0,
-          overlay_transparency: 50
+          overlay_transparency: 50,
+          blendMode: 'normal',
         },
       }
     }
@@ -132,11 +134,17 @@ const useStore = defineStore('store', {
           const imageOverlay = L.imageOverlay(site.imageUrl, layerBounds, {
             opacity: site.opacity,
             interactive: false,
-            className: 'pixelated-overlay' // Add CSS class for pixelated rendering
+            className: 'pixelated-overlay', // Add CSS class for pixelated rendering
           });
           imageOverlay.addTo(this.map as L.Map);
           imageOverlay.bringToFront();
           this.siteLayers.push(imageOverlay);
+
+          // Apply blend mode
+          const element = imageOverlay.getElement();
+          if (element) {
+            element.style.mixBlendMode = this.splatParams.display.blendMode;
+          }
         } else if (site.raster && site.raster.width && site.raster.height) {
           // Fallback to GeoRasterLayer if no PNG (e.g. imported files)
           const rasterLayer = new GeoRasterLayer({
@@ -162,12 +170,14 @@ const useStore = defineStore('store', {
               // Save current globalAlpha
               const prevAlpha = context.globalAlpha;
               context.globalAlpha = site.opacity;
+              context.globalCompositeOperation = this.splatParams.display.blendMode;
 
               context.fillStyle = `rgba(${r},${g},${b},${alpha})`;
               context.fillRect(x, y, width, height);
 
               // Restore globalAlpha
               context.globalAlpha = prevAlpha;
+              context.globalCompositeOperation = 'normal';
             }
           } as any);
           console.log(`Created GeoRasterLayer for layer ${index}`);
@@ -388,7 +398,11 @@ const useStore = defineStore('store', {
 
             // Get address
             const addressName = await this.reverseGeocode(this.splatParams.transmitter.tx_lat, this.splatParams.transmitter.tx_lon);
-            this.splatParams.transmitter.name = `${this.splatParams.transmitter.tx_height}m AGL - ${addressName}`;
+            let finalName = `${this.splatParams.transmitter.tx_height}m AGL - ${addressName}`;
+            if (this.splatParams.transmitter.nickname) {
+              finalName = `${this.splatParams.transmitter.nickname} - ${finalName}`;
+            }
+            this.splatParams.transmitter.name = finalName;
 
             // Fetch the GeoTIFF buffer immediately to store it
             let geoTiffBuffer: ArrayBuffer | undefined;
@@ -507,6 +521,7 @@ const useStore = defineStore('store', {
         const defaultParams: SplatParams = {
           transmitter: {
             name: name,
+            nickname: '',
             tx_lat: centerLat,
             tx_lon: centerLon,
             tx_power: 0.1,
@@ -540,7 +555,8 @@ const useStore = defineStore('store', {
             color_scale: 'plasma',
             min_dbm: -130.0,
             max_dbm: -80.0,
-            overlay_transparency: 50
+            overlay_transparency: 50,
+            blendMode: 'normal'
           }
         };
 

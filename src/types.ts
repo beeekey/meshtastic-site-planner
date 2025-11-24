@@ -13,6 +13,7 @@ export interface Site {
 export interface SplatParams {
     transmitter: {
         name: string;
+        nickname?: string;
         tx_lat: number;
         tx_lon: number;
         tx_power: number;
@@ -46,5 +47,6 @@ export interface SplatParams {
         min_dbm: number;
         max_dbm: number;
         overlay_transparency: number;
+        blendMode: string;
     };
 }

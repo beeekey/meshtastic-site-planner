@@ -33,6 +33,24 @@
         </div>
         <div class="row g-2 mt-2">
             <div class="col-12">
+                <label for="blend-mode">Blend Mode</label>
+                <select v-model="display.blendMode" @change="store.redrawSites()" id="blend-mode" class="form-select form-select-sm">
+                    <option value="normal">Normal</option>
+                    <option value="multiply">Multiply</option>
+                    <option value="screen">Screen</option>
+                    <option value="overlay">Overlay</option>
+                    <option value="darken">Darken</option>
+                    <option value="lighten">Lighten</option>
+                    <option value="color-dodge">Color Dodge</option>
+                    <option value="color-burn">Color Burn</option>
+                    <option value="hard-light">Hard Light</option>
+                    <option value="soft-light">Soft Light</option>
+                    <option value="difference">Difference</option>
+                </select>
+            </div>
+        </div>
+        <div class="row g-2 mt-2">
+            <div class="col-12">
                 <div class="form-check form-switch">
                     <input class="form-check-input" type="checkbox" id="showBorders" v-model="store.showBorders" @change="store.redrawSites()">
                     <label class="form-check-label" for="showBorders">Show Debug Borders</label>
