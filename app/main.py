@@ -63,11 +63,13 @@ async def calculate_overlap(
     images: List[UploadFile] = File(...),
     bounds: List[str] = Form(...),
     color: str = Form('#00ff00'),
-    opacity: str = Form('0.7')
+    opacity: str = Form('0.7'),
+    mode: str = Form('any')
 ):
     """
     Accepts multiple PNG images with their geographic bounds and returns a PNG showing the overlap.
     The images are reprojected onto a common grid before calculating the overlap.
+    mode: 'any' (>= 2 layers) or 'all' (all layers)
     """
     try:
         # 1. Read images and parse bounds
@@ -138,13 +140,21 @@ async def calculate_overlap(
             reprojected_arrays.append(destination.transpose(1, 2, 0))
 
         # 4. Calculate overlap from reprojected images
-        overlap_mask = np.ones((out_height, out_width), dtype=bool)
+        # We want to find areas where at least 2 layers overlap
+        overlap_count = np.zeros((out_height, out_width), dtype=np.int8)
         if not reprojected_arrays:
             # Handle case with no valid inputs
             return JSONResponse({"error": "No valid image data to process for overlap."}, status_code=400)
             
         for arr in reprojected_arrays:
-            overlap_mask &= (arr[:, :, 3] > 0)
+            # Add 1 where alpha > 0
+            overlap_count += (arr[:, :, 3] > 0).astype(np.int8)
+            
+        # Create mask based on mode
+        if mode == 'all':
+            overlap_mask = overlap_count == len(reprojected_arrays)
+        else: # 'any' or default
+            overlap_mask = overlap_count >= 2
 
         # 5. Create output image
         from matplotlib.colors import to_rgba

@@ -51,6 +51,7 @@ const useStore = defineStore('store', {
       showBorders: false,
       // Overlap Layer State
       showSingleColorOverlap: false,
+      overlapMode: 'any' as 'any' | 'all',
       overlapColor: '#00ff00',
       overlapOpacity: 0.7,
       overlapLoading: false,
@@ -998,6 +999,10 @@ const useStore = defineStore('store', {
       this.overlapColor = color;
       this.calculateOverlap();
     },
+    setOverlapMode(mode: 'any' | 'all') {
+      this.overlapMode = mode;
+      this.calculateOverlap();
+    },
     setOverlapOpacity(opacity: number) {
       this.overlapOpacity = opacity;
       if (this.overlapLayer) {
@@ -1022,9 +1027,10 @@ const useStore = defineStore('store', {
       const visibleIds = visibleSites.map(s => s.id).sort();
       const idsChanged = JSON.stringify(visibleIds) !== JSON.stringify(this.lastOverlapLayerIds);
       const colorChanged = this.overlapColor !== this.lastOverlapColor;
+      const modeChanged = this.overlapMode !== (this as any).lastOverlapMode; // We need to track last mode too
 
       // If nothing changed and we have a layer, just ensure it's on map
-      if (!idsChanged && !colorChanged && this.overlapLayer) {
+      if (!idsChanged && !colorChanged && !modeChanged && this.overlapLayer) {
         if (!this.map.hasLayer(this.overlapLayer)) {
           this.overlapLayer.addTo(this.map);
           this.overlapLayer.bringToFront();
@@ -1085,6 +1091,7 @@ const useStore = defineStore('store', {
         formData.append('color', this.overlapColor);
         // We send opacity 1.0 to backend to get solid mask, then apply Leaflet opacity
         formData.append('opacity', '1.0');
+        formData.append('mode', this.overlapMode);
 
         const response = await fetch('/overlap', {
           method: 'POST',
@@ -1136,6 +1143,7 @@ const useStore = defineStore('store', {
 
         this.lastOverlapLayerIds = visibleIds;
         this.lastOverlapColor = this.overlapColor;
+        (this as any).lastOverlapMode = this.overlapMode;
 
       } catch (e) {
         console.error("Error calculating overlap:", e);

@@ -30,12 +30,25 @@
       <label class="form-check-label" for="overlap-toggle">
         Show overlap in single color
       </label>
-      <div v-if="store.showSingleColorOverlap" class="mt-2 d-flex gap-3 align-items-center">
-        <label class="form-label mb-0" for="overlap-color">Color</label>
-        <input type="color" id="overlap-color" v-model="overlapColor" @input="updateOverlapColor" style="width: 2rem; height: 2rem; border: none; background: none;">
-        <label class="form-label mb-0" for="overlap-opacity">Opacity</label>
-        <input type="range" id="overlap-opacity" min="0" max="1" step="0.05" v-model.number="overlapOpacity" @input="updateOverlapOpacity" style="width: 100px;">
-        <span class="ms-2">{{ Math.round(overlapOpacity * 100) }}%</span>
+      <div v-if="store.showSingleColorOverlap" class="mt-2">
+        <div class="d-flex gap-3 align-items-center mb-2">
+          <label class="form-label mb-0" for="overlap-color">Color</label>
+          <input type="color" id="overlap-color" v-model="overlapColor" @input="updateOverlapColor" style="width: 2rem; height: 2rem; border: none; background: none;">
+          <label class="form-label mb-0" for="overlap-opacity">Opacity</label>
+          <input type="range" id="overlap-opacity" min="0" max="1" step="0.05" v-model.number="overlapOpacity" @input="updateOverlapOpacity" style="width: 100px;">
+          <span class="ms-2">{{ Math.round(overlapOpacity * 100) }}%</span>
+        </div>
+        <div class="d-flex gap-3 align-items-center">
+             <label class="form-label mb-0 me-2">Mode:</label>
+             <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="overlapMode" id="mode-any" value="any" :checked="store.overlapMode === 'any'" @change="store.setOverlapMode('any')">
+                <label class="form-check-label" for="mode-any">Any (>=2)</label>
+             </div>
+             <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="overlapMode" id="mode-all" value="all" :checked="store.overlapMode === 'all'" @change="store.setOverlapMode('all')">
+                <label class="form-check-label" for="mode-all">All</label>
+             </div>
+        </div>
       </div>
     </div>
 
