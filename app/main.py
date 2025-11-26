@@ -10,9 +10,13 @@ Endpoints:
     - /result/{task_id}: Retrieves the result (GeoTIFF file) of a given prediction task.
 """
 
+import logging
 import redis
 import json
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File
+from typing import List
+from PIL import Image
+import numpy as np
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +25,11 @@ from app.services.splat import Splat
 from app.models.CoveragePredictionRequest import CoveragePredictionRequest
 import logging
 import io
+import rasterio
+from rasterio.warp import reproject, Resampling
 # import os
+
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +43,9 @@ splat_service = Splat(splat_path="/app/splat")
 # Initialize FastAPI app
 app = FastAPI()
 
+
+
+
 # Add CORS middleware to allow requests from your frontend
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +54,118 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
+
+# Overlap endpoint (moved below app definition)
+from fastapi import Form
+
+@app.post("/overlap")
+async def calculate_overlap(
+    images: List[UploadFile] = File(...),
+    bounds: List[str] = Form(...),
+    color: str = Form('#00ff00'),
+    opacity: str = Form('0.7')
+):
+    """
+    Accepts multiple PNG images with their geographic bounds and returns a PNG showing the overlap.
+    The images are reprojected onto a common grid before calculating the overlap.
+    """
+    try:
+        # 1. Read images and parse bounds
+        src_images = []
+        src_bounds = []
+        for img_file, bound_str in zip(images, bounds):
+            img = Image.open(img_file.file).convert("RGBA")
+            src_images.append(np.array(img))
+            # Bounds from frontend are [[south, west], [north, east]]
+            b = json.loads(bound_str)
+            # Convert to (west, south, east, north) for rasterio
+            src_bounds.append((b[0][1], b[0][0], b[1][1], b[1][0]))
+
+        # 2. Determine output grid (union of all bounds)
+        total_west = min(b[0] for b in src_bounds)
+        total_south = min(b[1] for b in src_bounds)
+        total_east = max(b[2] for b in src_bounds)
+        total_north = max(b[3] for b in src_bounds)
+
+        # Use resolution of the first image as a reference
+        first_img_arr = src_images[0]
+        first_bounds = src_bounds[0]
+        src_height, src_width, _ = first_img_arr.shape
+
+        if src_width == 0 or src_height == 0:
+            return JSONResponse({"error": "An input image has zero width or height."}, status_code=400)
+
+        res_x = (first_bounds[2] - first_bounds[0]) / src_width
+        res_y = (first_bounds[3] - first_bounds[1]) / src_height
+        
+        if res_x == 0 or res_y == 0:
+            # This can happen if bounds are invalid
+            logger.error(f"Calculated resolution is zero. res_x: {res_x}, res_y: {res_y}, first_bounds: {first_bounds}, shape: ({src_width}, {src_height})")
+            return JSONResponse({"error": "Could not determine a valid resolution from input images."}, status_code=400)
+
+        out_width = int((total_east - total_west) / res_x)
+        out_height = int((total_north - total_south) / res_y)
+        
+        if out_width <= 0 or out_height <= 0:
+             logger.error(f"Output image has zero or negative dimensions. out_width: {out_width}, out_height: {out_height}")
+             return JSONResponse({"error": "Calculated output dimensions are invalid."}, status_code=400)
+
+
+        # Destination transform
+        dst_transform = rasterio.transform.from_bounds(total_west, total_south, total_east, total_north, out_width, out_height)
+        dst_crs = 'EPSG:4326'
+
+        # 3. Reproject each image
+        reprojected_arrays = []
+        for img_arr, bound in zip(src_images, src_bounds):
+            src_h, src_w, _ = img_arr.shape
+            src_transform = rasterio.transform.from_bounds(bound[0], bound[1], bound[2], bound[3], width=src_w, height=src_h)
+            
+            source_raster = img_arr.transpose(2, 0, 1)
+
+            destination = np.zeros((4, out_height, out_width), dtype=np.uint8)
+
+            reproject(
+                source=source_raster,
+                destination=destination,
+                src_transform=src_transform,
+                src_crs=dst_crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest
+            )
+            
+            reprojected_arrays.append(destination.transpose(1, 2, 0))
+
+        # 4. Calculate overlap from reprojected images
+        overlap_mask = np.ones((out_height, out_width), dtype=bool)
+        if not reprojected_arrays:
+            # Handle case with no valid inputs
+            return JSONResponse({"error": "No valid image data to process for overlap."}, status_code=400)
+            
+        for arr in reprojected_arrays:
+            overlap_mask &= (arr[:, :, 3] > 0)
+
+        # 5. Create output image
+        from matplotlib.colors import to_rgba
+        try:
+            rgba = to_rgba(color, float(opacity))
+            r, g, b, a = [int(round(x * 255)) for x in rgba]
+        except Exception:
+            r, g, b, a = 0, 255, 0, int(float(opacity) * 255)
+
+        result = np.zeros((out_height, out_width, 4), dtype=np.uint8)
+        result[overlap_mask] = [r, g, b, a]
+
+        out_img = Image.fromarray(result, "RGBA")
+        buf = io.BytesIO()
+        out_img.save(buf, format="PNG")
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        logger.error(f"Error calculating overlap: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    
 
 def run_splat(task_id: str, request: CoveragePredictionRequest):
     """
