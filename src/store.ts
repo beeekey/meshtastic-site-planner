@@ -47,7 +47,16 @@ const useStore = defineStore('store', {
       currentMarker: undefined as undefined | L.Marker,
       localSites: [] as Site[], //useLocalStorage('localSites', ),
       simulationState: 'idle',
+
       showBorders: false,
+      // Overlap Layer State
+      showSingleColorOverlap: false,
+      overlapColor: '#00ff00',
+      overlapOpacity: 0.7,
+      overlapLoading: false,
+      overlapLayer: undefined as undefined | L.ImageOverlay,
+      lastOverlapLayerIds: [] as string[],
+      lastOverlapColor: '',
       splatParams: <SplatParams>{
         transmitter: {
           name: randanimalSync(),
@@ -277,6 +286,12 @@ const useStore = defineStore('store', {
         }
       });
 
+
+
+      // Trigger overlap calculation if enabled
+      if (this.showSingleColorOverlap) {
+        this.calculateOverlap();
+      }
     },
     initMap() {
       // Guard against re-initialization
@@ -356,7 +371,7 @@ const useStore = defineStore('store', {
       this.map.on("baselayerchange", (e: L.LayersControlEvent) => {
         if (!this.map) return;
         const newBaseLayer = e.layer;
-        
+
         const doRedraw = () => {
           if (!this.map) return;
           this.redrawSites();
@@ -973,6 +988,159 @@ const useStore = defineStore('store', {
       if (this.localSites[index]) {
         Object.assign(this.localSites[index], changes);
         this.redrawSites();
+      }
+    },
+    setShowSingleColorOverlap(value: boolean) {
+      this.showSingleColorOverlap = value;
+      this.calculateOverlap();
+    },
+    setOverlapColor(color: string) {
+      this.overlapColor = color;
+      this.calculateOverlap();
+    },
+    setOverlapOpacity(opacity: number) {
+      this.overlapOpacity = opacity;
+      if (this.overlapLayer) {
+        this.overlapLayer.setOpacity(opacity);
+      }
+    },
+    async calculateOverlap() {
+      if (!this.map) return;
+
+      // If disabled, remove layer and clear state
+      if (!this.showSingleColorOverlap) {
+        if (this.overlapLayer) {
+          this.map.removeLayer(this.overlapLayer);
+          this.overlapLayer = undefined;
+        }
+        this.lastOverlapLayerIds = [];
+        return;
+      }
+
+      // Get visible sites
+      const visibleSites = this.localSites.filter(s => s.visible);
+      const visibleIds = visibleSites.map(s => s.id).sort();
+      const idsChanged = JSON.stringify(visibleIds) !== JSON.stringify(this.lastOverlapLayerIds);
+      const colorChanged = this.overlapColor !== this.lastOverlapColor;
+
+      // If nothing changed and we have a layer, just ensure it's on map
+      if (!idsChanged && !colorChanged && this.overlapLayer) {
+        if (!this.map.hasLayer(this.overlapLayer)) {
+          this.overlapLayer.addTo(this.map);
+          this.overlapLayer.bringToFront();
+        }
+        return;
+      }
+
+      // If no sites, remove layer
+      if (visibleSites.length === 0) {
+        if (this.overlapLayer) {
+          this.map.removeLayer(this.overlapLayer);
+          this.overlapLayer = undefined;
+        }
+        this.lastOverlapLayerIds = [];
+        return;
+      }
+
+      this.overlapLoading = true;
+      console.log('Calculating overlap for sites:', visibleIds);
+
+      try {
+        const formData = new FormData();
+        // We need to send bounds and images
+        // For images, we need blobs.
+        // If we have rawBuffer, use it. If not, we might need to fetch imageUrl?
+        // But wait, imageUrl is a URL. The backend expects UploadFile.
+        // If we have rawBuffer (GeoTIFF), we can send that.
+        // If we only have imageUrl (PNG from backend), we need to fetch it as blob.
+
+        const boundsList: string[] = [];
+
+        for (const site of visibleSites) {
+          let blob: Blob | null = null;
+          if (site.rawBuffer) {
+            blob = new Blob([site.rawBuffer], { type: 'image/tiff' });
+          } else if (site.imageUrl) {
+            // Fetch the image
+            try {
+              const res = await fetch(site.imageUrl);
+              if (res.ok) {
+                blob = await res.blob();
+              }
+            } catch (e) {
+              console.error("Failed to fetch image for overlap:", site.imageUrl);
+            }
+          }
+
+          if (blob) {
+            // Determine filename extension
+            const ext = site.rawBuffer ? 'tif' : 'png';
+            formData.append('images', blob, `layer-${site.id}.${ext}`);
+            // Bounds: [[south, west], [north, east]]
+            // Backend expects JSON string of this
+            formData.append('bounds', JSON.stringify(site.bounds));
+          }
+        }
+
+        formData.append('color', this.overlapColor);
+        // We send opacity 1.0 to backend to get solid mask, then apply Leaflet opacity
+        formData.append('opacity', '1.0');
+
+        const response = await fetch('/overlap', {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          throw new Error(`Overlap calculation failed: ${response.statusText}`);
+        }
+
+        const resultBlob = await response.blob();
+        const resultUrl = URL.createObjectURL(resultBlob);
+
+        // Remove old layer
+        if (this.overlapLayer) {
+          this.map.removeLayer(this.overlapLayer);
+        }
+
+        // We need bounds for the new layer.
+        // The backend calculates the union of bounds.
+        // But it doesn't return them in the response (it returns an image).
+        // Wait, if it returns an image, how do I know where to place it?
+        // The backend `calculate_overlap` returns a PNG. It does NOT return the bounds.
+        // This is a problem. The backend should return bounds or I need to calculate union bounds here.
+        // The backend code:
+        // total_west = min(b[0] for b in src_bounds) ...
+        // It calculates union bounds.
+        // Since I have all the bounds here, I can calculate the union bounds myself!
+
+        let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+        visibleSites.forEach(s => {
+          // bounds is [[south, west], [north, east]]
+          const b = s.bounds as [[number, number], [number, number]];
+          minLat = Math.min(minLat, b[0][0]);
+          minLon = Math.min(minLon, b[0][1]);
+          maxLat = Math.max(maxLat, b[1][0]);
+          maxLon = Math.max(maxLon, b[1][1]);
+        });
+
+        const unionBounds: [[number, number], [number, number]] = [[minLat, minLon], [maxLat, maxLon]];
+
+        this.overlapLayer = L.imageOverlay(resultUrl, unionBounds, {
+          opacity: this.overlapOpacity,
+          interactive: false
+        });
+
+        this.overlapLayer.addTo(this.map);
+        this.overlapLayer.bringToFront();
+
+        this.lastOverlapLayerIds = visibleIds;
+        this.lastOverlapColor = this.overlapColor;
+
+      } catch (e) {
+        console.error("Error calculating overlap:", e);
+      } finally {
+        this.overlapLoading = false;
       }
     }
   }

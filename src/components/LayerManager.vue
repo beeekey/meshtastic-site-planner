@@ -1,4 +1,10 @@
 <template>
+    <div v-if="store.showSingleColorOverlap && store.overlapLoading" class="d-flex justify-content-center align-items-center my-3">
+      <div class="spinner-border text-success" role="status">
+        <span class="visually-hidden">Calculating overlap...</span>
+      </div>
+      <span class="ms-2">Calculating overlap layer...</span>
+    </div>
   <div>
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h6 class="m-0">Layers</h6>
@@ -7,9 +13,29 @@
           Clear All
         </button>
         <label for="import-layer" class="btn btn-sm btn-outline-light">
-        <i class="bi bi-upload"></i> Import Layer
+          <i class="bi bi-upload"></i> Import Layer
+        </label>
+        <input type="file" id="import-layer" accept=".tif,.tiff" @change="handleImport" style="display: none;">
+      </div>
+    </div>
+
+    <div class="form-check form-switch mb-2">
+      <input
+        class="form-check-input"
+        type="checkbox"
+        id="overlap-toggle"
+        :checked="store.showSingleColorOverlap"
+        @change="toggleOverlap($event)"
+      >
+      <label class="form-check-label" for="overlap-toggle">
+        Show overlap in single color
       </label>
-      <input type="file" id="import-layer" accept=".tif,.tiff" @change="handleImport" style="display: none;">
+      <div v-if="store.showSingleColorOverlap" class="mt-2 d-flex gap-3 align-items-center">
+        <label class="form-label mb-0" for="overlap-color">Color</label>
+        <input type="color" id="overlap-color" v-model="overlapColor" @input="updateOverlapColor" style="width: 2rem; height: 2rem; border: none; background: none;">
+        <label class="form-label mb-0" for="overlap-opacity">Opacity</label>
+        <input type="range" id="overlap-opacity" min="0" max="1" step="0.05" v-model.number="overlapOpacity" @input="updateOverlapOpacity" style="width: 100px;">
+        <span class="ms-2">{{ Math.round(overlapOpacity * 100) }}%</span>
       </div>
     </div>
 
@@ -59,10 +85,28 @@
 </template>
 
 <script setup lang="ts">
+import { ref, watch } from 'vue';
+const toggleOverlap = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  store.setShowSingleColorOverlap(target.checked);
+};
 import { useStore } from '../store.ts';
 import { saveAs } from 'file-saver';
 
 const store = useStore();
+
+const overlapColor = ref(store.overlapColor);
+const overlapOpacity = ref(store.overlapOpacity);
+
+const updateOverlapColor = () => {
+  store.setOverlapColor(overlapColor.value);
+};
+const updateOverlapOpacity = () => {
+  store.setOverlapOpacity(overlapOpacity.value);
+};
+
+watch(() => store.overlapColor, (val) => { overlapColor.value = val; });
+watch(() => store.overlapOpacity, (val) => { overlapOpacity.value = val; });
 
 const toggleVisibility = (index: number, event: Event) => {
   const target = event.target as HTMLInputElement;
