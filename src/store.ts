@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia';
+import { markRaw } from 'vue';
 import { randanimalSync } from 'randanimal';
 import L from 'leaflet';
 import GeoRasterLayer from 'georaster-layer-for-leaflet';
@@ -105,7 +106,7 @@ const useStore = defineStore('store', {
       this.splatParams.transmitter.tx_lat = lat
       this.splatParams.transmitter.tx_lon = lon
       console.log('Transmitter coordinates updated:', lat, lon)
-      if (this.map && this.map.getCenter) {
+      if (this.map) {
         this.map.setView([lat, lon], this.map.getZoom())
       }
     },
@@ -165,9 +166,9 @@ const useStore = defineStore('store', {
       this.siteLayers.forEach(layer => {
         try {
           if (this.map) {
-            detachLayerEvents(this.map, layer);
-            if (this.map.hasLayer(layer)) {
-              this.map.removeLayer(layer);
+            detachLayerEvents(this.map as any, layer);
+            if ((this.map as any).hasLayer(layer)) {
+              (this.map as any).removeLayer(layer);
             }
           }
         } catch (e) {
@@ -198,7 +199,7 @@ const useStore = defineStore('store', {
         if (this.showBorders) {
           const border = L.rectangle(layerBounds, { color: index === 0 ? 'blue' : 'green', weight: 1, fill: false });
           border.addTo(this.map as L.Map);
-          this.siteLayers.push(border);
+          this.siteLayers.push(markRaw(border));
         }
 
         // Prioritize ImageURL (PNG) for stability, with pixelated rendering for quality
@@ -210,7 +211,7 @@ const useStore = defineStore('store', {
           });
           imageOverlay.addTo(this.map as L.Map);
           imageOverlay.bringToFront();
-          this.siteLayers.push(imageOverlay);
+          this.siteLayers.push(markRaw(imageOverlay));
 
           // Apply blend mode
           const element = imageOverlay.getElement();
@@ -255,7 +256,7 @@ const useStore = defineStore('store', {
           console.log(`Created GeoRasterLayer for layer ${index}`);
           rasterLayer.addTo(this.map as L.Map);
           rasterLayer.bringToFront();
-          this.siteLayers.push(rasterLayer);
+          this.siteLayers.push(markRaw(rasterLayer));
         }
 
         // Render GeoJSON if available
@@ -283,7 +284,7 @@ const useStore = defineStore('store', {
           });
           geoJsonLayer.addTo(this.map as L.Map);
           geoJsonLayer.bringToFront();
-          this.siteLayers.push(geoJsonLayer);
+          this.siteLayers.push(markRaw(geoJsonLayer));
         }
       });
 
@@ -301,7 +302,7 @@ const useStore = defineStore('store', {
         return;
       }
 
-      this.map = L.map("map", {
+      this.map = markRaw(L.map("map", {
         center: [46.8182, 8.2275],
         zoom: 8,
         zoomControl: false,
@@ -309,7 +310,7 @@ const useStore = defineStore('store', {
         zoomAnimationThreshold: 0,
         fadeAnimation: false,
         markerZoomAnimation: false,
-      });
+      }));
       const position: [number, number] = [this.splatParams.transmitter.tx_lat, this.splatParams.transmitter.tx_lon];
       this.map.setView(position, 10);
 
@@ -317,7 +318,7 @@ const useStore = defineStore('store', {
 
       this.map.on('layerremove', (evt: L.LayerEvent) => {
         if (!this.map) return;
-        detachLayerEvents(this.map, evt.layer);
+        detachLayerEvents(this.map as any, evt.layer);
       });
 
       const commonTileOptions = {
@@ -1015,7 +1016,7 @@ const useStore = defineStore('store', {
       // If disabled, remove layer and clear state
       if (!this.showSingleColorOverlap) {
         if (this.overlapLayer) {
-          this.map.removeLayer(this.overlapLayer);
+          (this.map as any).removeLayer(this.overlapLayer as any);
           this.overlapLayer = undefined;
         }
         this.lastOverlapLayerIds = [];
@@ -1031,8 +1032,8 @@ const useStore = defineStore('store', {
 
       // If nothing changed and we have a layer, just ensure it's on map
       if (!idsChanged && !colorChanged && !modeChanged && this.overlapLayer) {
-        if (!this.map.hasLayer(this.overlapLayer)) {
-          this.overlapLayer.addTo(this.map);
+        if (!(this.map as any).hasLayer(this.overlapLayer as any)) {
+          (this.overlapLayer as any).addTo(this.map as any);
           this.overlapLayer.bringToFront();
         }
         return;
@@ -1041,7 +1042,7 @@ const useStore = defineStore('store', {
       // If no sites, remove layer
       if (visibleSites.length === 0) {
         if (this.overlapLayer) {
-          this.map.removeLayer(this.overlapLayer);
+          (this.map as any).removeLayer(this.overlapLayer as any);
           this.overlapLayer = undefined;
         }
         this.lastOverlapLayerIds = [];
@@ -1060,7 +1061,7 @@ const useStore = defineStore('store', {
         // If we have rawBuffer (GeoTIFF), we can send that.
         // If we only have imageUrl (PNG from backend), we need to fetch it as blob.
 
-        const boundsList: string[] = [];
+
 
         for (const site of visibleSites) {
           let blob: Blob | null = null;
@@ -1107,7 +1108,7 @@ const useStore = defineStore('store', {
 
         // Remove old layer
         if (this.overlapLayer) {
-          this.map.removeLayer(this.overlapLayer);
+          (this.map as any).removeLayer(this.overlapLayer as any);
         }
 
         // We need bounds for the new layer.
@@ -1133,12 +1134,12 @@ const useStore = defineStore('store', {
 
         const unionBounds: [[number, number], [number, number]] = [[minLat, minLon], [maxLat, maxLon]];
 
-        this.overlapLayer = L.imageOverlay(resultUrl, unionBounds, {
+        this.overlapLayer = markRaw(L.imageOverlay(resultUrl, unionBounds, {
           opacity: this.overlapOpacity,
           interactive: false
-        });
+        }));
 
-        this.overlapLayer.addTo(this.map);
+        (this.overlapLayer as any).addTo(this.map as any);
         this.overlapLayer.bringToFront();
 
         this.lastOverlapLayerIds = visibleIds;
