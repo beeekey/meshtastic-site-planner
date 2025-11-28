@@ -6,10 +6,10 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     proxy: {
-      '/predict': 'http://localhost:8080/',
-      '/status': 'http://localhost:8080/',
-      '/result': 'http://localhost:8080/',
-      '/overlap': 'http://localhost:8080/',
+      '/predict': 'http://127.0.0.1:8080/',
+      '/status': 'http://127.0.0.1:8080/',
+      '/result': 'http://127.0.0.1:8080/',
+      '/overlap': 'http://127.0.0.1:8080/',
     },
   },
   build: {
