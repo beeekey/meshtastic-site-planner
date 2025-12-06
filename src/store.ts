@@ -7,7 +7,7 @@ import parseGeoraster from 'georaster';
 
 import { type Site, type SplatParams } from './types.ts';
 import { cloneObject } from './utils.ts';
-import { redPinMarker } from './layers.ts';
+import { redPinMarker, mountainTriangleIcon, blueDotIcon } from './layers.ts';
 
 // Defensive guard: ignore grid layer zoom callbacks if Leaflet fires them after the layer was removed.
 const gridLayerProto: any = (L as any).GridLayer?.prototype;
@@ -46,6 +46,11 @@ const useStore = defineStore('store', {
       redrawTimeoutId: undefined as number | undefined,
       siteLayers: [] as any[],
       currentMarker: undefined as undefined | L.Marker,
+      mountainGeojson: undefined as any,
+      nodesGeojson: undefined as any,
+      mountainLayer: undefined as undefined | L.GeoJSON,
+      nodesLayer: undefined as undefined | L.GeoJSON,
+      customPanesReady: false,
       localSites: [] as Site[], //useLocalStorage('localSites', ),
       simulationState: 'idle',
 
@@ -102,6 +107,105 @@ const useStore = defineStore('store', {
     }
   },
   actions: {
+    ensureCustomPanes() {
+      if (!this.map) return;
+      if (this.customPanesReady) return;
+
+      const mountainPane = (this.map as L.Map).getPane('mountainPane') || (this.map as L.Map).createPane('mountainPane');
+      const nodesPane = (this.map as L.Map).getPane('nodesPane') || (this.map as L.Map).createPane('nodesPane');
+      if (mountainPane) {
+        mountainPane.style.zIndex = '650';
+        mountainPane.style.pointerEvents = 'auto';
+      }
+      if (nodesPane) {
+        nodesPane.style.zIndex = '651';
+        nodesPane.style.pointerEvents = 'auto';
+      }
+
+      this.customPanesReady = true;
+    },
+    removeCustomLayer(layer?: L.Layer) {
+      if (!this.map || !layer) return;
+      try {
+        detachLayerEvents(this.map as any, layer);
+        if ((this.map as any).hasLayer(layer)) {
+          (this.map as any).removeLayer(layer);
+        }
+      } catch (err) {
+        console.warn('Failed to remove custom layer', err);
+      }
+    },
+    applyMountainGeojson(geojson: any) {
+      this.mountainGeojson = geojson;
+      if (!this.map) {
+        console.warn('Mountain GeoJSON set but map not ready yet');
+        return;
+      }
+      this.ensureCustomPanes();
+      this.removeCustomLayer(this.mountainLayer as any);
+
+      const layer = L.geoJSON(geojson, {
+        pane: 'mountainPane',
+        pointToLayer: (_feature, latlng) => L.marker(latlng, { icon: mountainTriangleIcon, pane: 'mountainPane' }),
+        style: () => ({
+          color: '#f6c344',
+          weight: 2,
+          opacity: 0.9,
+          fillOpacity: 0,
+          pane: 'mountainPane',
+        }),
+      });
+      layer.addTo(this.map as L.Map);
+      (layer as any).bringToFront();
+      this.mountainLayer = markRaw(layer);
+      const featureCount = geojson?.features?.length ?? 'n/a';
+      console.log('Mounted mountain GeoJSON layer', { featureCount });
+    },
+    applyNodesGeojson(geojson: any) {
+      this.nodesGeojson = geojson;
+      if (!this.map) return;
+      this.ensureCustomPanes();
+      this.removeCustomLayer(this.nodesLayer as any);
+
+      const layer = L.geoJSON(geojson, {
+        pane: 'nodesPane',
+        pointToLayer: (_feature, latlng) => L.marker(latlng, { icon: blueDotIcon, pane: 'nodesPane' }),
+        style: () => ({
+          color: '#1e90ff',
+          weight: 2,
+          opacity: 0.8,
+          fillOpacity: 0.15,
+          pane: 'nodesPane',
+        }),
+      });
+      layer.addTo(this.map as L.Map);
+      (layer as any).bringToFront();
+      this.nodesLayer = markRaw(layer);
+    },
+    pinCustomGeoLayers() {
+      if (!this.map) return;
+      this.ensureCustomPanes();
+
+      if (!this.mountainLayer && this.mountainGeojson) {
+        this.applyMountainGeojson(this.mountainGeojson);
+      } else if (this.mountainLayer) {
+        if (!(this.map as any).hasLayer(this.mountainLayer as any)) {
+          (this.mountainLayer as any).addTo(this.map as any);
+        }
+        (this.mountainLayer as any).bringToFront();
+      } else {
+        console.log('No mountain GeoJSON to pin');
+      }
+
+      if (!this.nodesLayer && this.nodesGeojson) {
+        this.applyNodesGeojson(this.nodesGeojson);
+      } else if (this.nodesLayer) {
+        if (!(this.map as any).hasLayer(this.nodesLayer as any)) {
+          (this.nodesLayer as any).addTo(this.map as any);
+        }
+        (this.nodesLayer as any).bringToFront();
+      }
+    },
     setTxCoords(lat: number, lon: number) {
       this.splatParams.transmitter.tx_lat = lat
       this.splatParams.transmitter.tx_lon = lon
@@ -290,6 +394,9 @@ const useStore = defineStore('store', {
 
 
 
+      // Keep imported GeoJSON overlays pinned above raster layers
+      this.pinCustomGeoLayers();
+
       // Trigger overlap calculation if enabled
       if (this.showSingleColorOverlap) {
         this.calculateOverlap();
@@ -313,6 +420,7 @@ const useStore = defineStore('store', {
       }));
       const position: [number, number] = [this.splatParams.transmitter.tx_lat, this.splatParams.transmitter.tx_lon];
       this.map.setView(position, 10);
+      this.ensureCustomPanes();
 
       L.control.zoom({ position: "bottomleft" }).addTo(this.map as L.Map);
 
@@ -413,6 +521,7 @@ const useStore = defineStore('store', {
 
       this.currentMarker = L.marker(position, { icon: redPinMarker }).addTo(this.map as L.Map).bindPopup("Transmitter site"); // Variable to hold the current marker
       this.redrawSites();
+      this.pinCustomGeoLayers();
     },
     async runSimulation() {
       console.log('Simulation running...')
@@ -984,6 +1093,36 @@ const useStore = defineStore('store', {
       } catch (error) {
         console.error("Failed to import layer:", error);
         alert("Failed to import layer. Please ensure it is a valid GeoTIFF.");
+      }
+    },
+    async importMountainGeojson(file: File) {
+      const timerLabel = `mountain-import:${file.name}`;
+      console.time(timerLabel);
+      console.log('Starting mountain GeoJSON import', { name: file.name, size: file.size });
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        if (!parsed || !parsed.type) throw new Error('Invalid GeoJSON');
+        this.applyMountainGeojson(parsed);
+        this.pinCustomGeoLayers();
+        console.log('Finished mountain GeoJSON import', { name: file.name, featureCount: parsed.features?.length ?? 'n/a' });
+      } catch (error) {
+        console.error("Failed to import mountain GeoJSON:", error);
+        alert("Failed to import mountain GeoJSON. Please select a valid GeoJSON file.");
+      } finally {
+        console.timeEnd(timerLabel);
+      }
+    },
+    async importNodesGeojson(file: File) {
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        if (!parsed || !parsed.type) throw new Error('Invalid GeoJSON');
+        this.applyNodesGeojson(parsed);
+        this.pinCustomGeoLayers();
+      } catch (error) {
+        console.error("Failed to import node GeoJSON:", error);
+        alert("Failed to import node GeoJSON. Please select a valid GeoJSON file.");
       }
     },
     updateLayer(index: number, changes: Partial<Site>) {

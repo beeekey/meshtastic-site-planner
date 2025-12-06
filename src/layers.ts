@@ -16,4 +16,27 @@ const chirpyMarker = L.divIcon({
   iconSize: [24, 40],
   iconAnchor: [12, 40],
 });
-export { chirpyMarker, redPinMarker };
+
+const mountainTriangleIcon = L.divIcon({
+  html: `
+    <svg width="22" height="20" viewBox="0 0 22 20" xmlns="http://www.w3.org/2000/svg">
+      <path d="M11 1 L21 19 H1 Z" fill="#f6c344" stroke="#7c4c00" stroke-width="1.5"/>
+    </svg>
+  `,
+  className: "mountain-triangle-icon",
+  iconSize: [22, 20],
+  iconAnchor: [11, 18],
+});
+
+const blueDotIcon = L.divIcon({
+  html: `
+    <svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="8" cy="8" r="6" fill="#1e90ff" stroke="#ffffff" stroke-width="2"/>
+    </svg>
+  `,
+  className: "node-blue-dot-icon",
+  iconSize: [16, 16],
+  iconAnchor: [8, 8],
+});
+
+export { chirpyMarker, redPinMarker, mountainTriangleIcon, blueDotIcon };

@@ -17,6 +17,14 @@
             <i class="bi bi-upload"></i> Import Layer
           </label>
           <input type="file" id="import-layer" accept=".tif,.tiff" @change="handleImport" style="display: none;">
+          <label for="import-mountain-geojson" class="btn btn-sm btn-outline-warning" title="Import mountain GeoJSON">
+            ⛰️ Mountains
+          </label>
+          <input type="file" id="import-mountain-geojson" accept=".geojson,application/geo+json,application/json" @change="handleMountainGeojsonImport" style="display: none;">
+          <label for="import-nodes-geojson" class="btn btn-sm btn-outline-info" title="Import nodes GeoJSON">
+            🔵 Nodes
+          </label>
+          <input type="file" id="import-nodes-geojson" accept=".geojson,application/geo+json,application/json" @change="handleNodesGeojsonImport" style="display: none;">
         </div>
       </div>
 
@@ -180,6 +188,34 @@ const handleImport = (event: Event) => {
     // Metadata is now embedded in the TIFF file, no need for separate JSON
     store.importLayer(file);
     target.value = ''; // Reset input
+  }
+};
+
+const handleMountainGeojsonImport = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  if (target.files && target.files.length > 0) {
+    const file = target.files[0];
+    const name = file.name.toLowerCase();
+    if (!name.endsWith('.geojson') && !name.endsWith('.json')) {
+      alert('Please select a GeoJSON file (.geojson or .json)');
+      return;
+    }
+    store.importMountainGeojson(file);
+    target.value = '';
+  }
+};
+
+const handleNodesGeojsonImport = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  if (target.files && target.files.length > 0) {
+    const file = target.files[0];
+    const name = file.name.toLowerCase();
+    if (!name.endsWith('.geojson') && !name.endsWith('.json')) {
+      alert('Please select a GeoJSON file (.geojson or .json)');
+      return;
+    }
+    store.importNodesGeojson(file);
+    target.value = '';
   }
 };
 </script>
