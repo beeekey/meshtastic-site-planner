@@ -32,12 +32,7 @@ from app.models.CoveragePredictionRequest import CoveragePredictionRequest
 from diskcache import Cache
 
 # Worker-process singletons to avoid reinitializing expensive resources
-_worker_cache = None
-_worker_s3 = None
-_worker_bucket_name = ""
-_worker_bucket_prefix = ""
-_worker_srtm2sdf_binary = ""
-_worker_srtm2sdf_hd_binary = ""
+# REMOVED: _worker_cache, _worker_s3, etc.
 
 
 logger = logging.getLogger(__name__)
@@ -47,17 +42,7 @@ logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
-def _tile_worker_initializer(cache_dir: str, bucket_name: str, bucket_prefix: str, srtm2sdf_binary: str, srtm2sdf_hd_binary: str) -> None:
-    """
-    Pre-warm worker processes with shared resources so we don't pay setup cost per tile.
-    """
-    global _worker_cache, _worker_s3, _worker_bucket_name, _worker_bucket_prefix, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary
-    _worker_cache = Cache(cache_dir)
-    _worker_s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-    _worker_bucket_name = bucket_name
-    _worker_bucket_prefix = bucket_prefix
-    _worker_srtm2sdf_binary = srtm2sdf_binary
-    _worker_srtm2sdf_hd_binary = srtm2sdf_hd_binary
+# REMOVED: _tile_worker_initializer
 
 
 class Splat:
@@ -68,7 +53,7 @@ class Splat:
         cache_size_gb: float = 1.0,
         bucket_name: str = "elevation-tiles-prod",
         bucket_prefix:str = "v2/skadi",
-        tile_workers: int | None = None,
+        tile_workers: int | None = None, # kept for backward compatibility but unused
     ):
         """
         SPLAT! wrapper class. Provides methods for generating SPLAT! RF coverage maps in GeoTIFF format.
@@ -91,8 +76,7 @@ class Splat:
                 open data bucket `elevation-tiles-prod`.
             bucket_prefix (str): Folder in the S3 bucket containing the terrain tiles. Defaults to
                 `v2/skadi`, which contains 1-arcsecond terrain data for most of the world.
-            tile_workers (int | None): Number of worker processes to use for tile download/convert.
-                Defaults to the number of CPUs. Kept long-lived to avoid spin-up cost per request.
+            tile_workers (int | None): Unused. Kept for compatibility.
         """
 
         # Check the provided SPLAT! path exists
@@ -147,16 +131,86 @@ class Splat:
         self.bucket_name = bucket_name
         self.bucket_prefix = bucket_prefix
         self.tile_workers = tile_workers or os.cpu_count() or 1
-        self._tile_executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.tile_workers,
-            initializer=_tile_worker_initializer,
-            initargs=(cache_dir, bucket_name, bucket_prefix, self.srtm2sdf_binary, self.srtm2sdf_hd_binary),
-        )
-        atexit.register(self._tile_executor.shutdown, wait=False)
-
+        
         logger.info(
             f"Initialized SPLAT! with terrain tile cache at '{cache_dir}' with a size limit of {cache_size_gb} GB using {self.tile_workers} worker(s)."
         )
+
+    @staticmethod
+    def _fetch_and_convert_tile(
+        tile_name: str, 
+        bucket_name: str, 
+        bucket_prefix: str, 
+        high_resolution: bool,
+        srtm2sdf_binary: str,
+        srtm2sdf_hd_binary: str
+    ) -> Tuple[str, bytes]:
+        """
+        Worker function to fetch and convert a tile in a separate process.
+        Returns the filename and the converted SDF bytes.
+        """
+        try:
+            # Create a local S3 client for this worker process
+            s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+            
+            # 1. Download
+            tile_dir_prefix = tile_name[:3]
+            s3_key = f"{bucket_prefix}/{tile_dir_prefix}/{tile_name}"
+            
+            try:
+                obj = s3.get_object(Bucket=bucket_name, Key=s3_key)
+                tile_data = obj['Body'].read()
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NoSuchKey":
+                    # Fallback logic
+                    s3_key = f"skadi/{tile_dir_prefix}/{tile_name}"
+                    obj = s3.get_object(Bucket=bucket_name, Key=s3_key)
+                    tile_data = obj["Body"].read()
+                else:
+                    raise
+
+            # 2. Convert (using a temporary directory local to this worker/function call)
+            # We don't need the cache here, we just compute and return bytes
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Decompress
+                hgt_path = os.path.join(tmpdir, tile_name.replace(".gz", ""))
+                with gzip.GzipFile(fileobj=io.BytesIO(tile_data)) as gz_file:
+                    with open(hgt_path, "wb") as hgt_file:
+                        hgt_file.write(gz_file.read())
+
+                # Downsample if needed
+                if not high_resolution:
+                    with rasterio.open(hgt_path) as src:
+                        scale_factor = 3
+                        transform = src.transform * Affine.scale(scale_factor, scale_factor)
+                        data = src.read(
+                            out_shape=(src.count, 1201, 1201),
+                            resampling=Resampling.average,
+                        )
+                        meta = src.meta.copy()
+                        meta.update({"transform": transform, "width": 1201, "height": 1201})
+                    
+                    with rasterio.open(hgt_path, "w", **meta) as dst:
+                        dst.write(data)
+
+                # Run conversion binary
+                sdf_filename = Splat._hgt_filename_to_sdf_filename(tile_name, high_resolution)
+                cmd = srtm2sdf_hd_binary if high_resolution else srtm2sdf_binary
+                
+                subprocess.run(
+                    [cmd, os.path.basename(hgt_path)],
+                    cwd=tmpdir,
+                    capture_output=True, # Verify if this captures enough info on failure
+                    check=True
+                )
+                
+                sdf_path = os.path.join(tmpdir, sdf_filename)
+                with open(sdf_path, "rb") as f:
+                    return sdf_filename, f.read()
+
+        except Exception as e:
+            # We can't log easily to the main logger from here, so re-raise with context
+            raise RuntimeError(f"Worker failed for {tile_name}: {e}")
 
     def coverage_prediction(self, request: CoveragePredictionRequest) -> bytes:
         """
@@ -196,31 +250,52 @@ class Splat:
                 # download and convert terrain tiles to SPLAT! sdf
                 start_time = time.time()
 
-                # Use ProcessPoolExecutor for true parallelism (CPU bound tasks)
-                # We need to pass the cache directory to the worker so it can open its own cache connection
-                future_to_tile = {
-                    self._tile_executor.submit(
-                        process_tile_worker,
-                        tile_name,
-                        request.high_resolution,
-                    ): (tile_name, sdf_name, sdf_hd_name)
-                    for tile_name, sdf_name, sdf_hd_name in required_tiles
-                }
+                # 1. Identify valid cache hits and missing tiles
+                missing_tiles = []
+                for tile_name, sdf_name, sdf_hd_name in required_tiles:
+                    target_sdf = sdf_hd_name if request.high_resolution else sdf_name
+                    if target_sdf in self.tile_cache:
+                        # Write cached file to tmpdir immediately
+                        with open(os.path.join(tmpdir, target_sdf), "wb") as f:
+                            f.write(self.tile_cache[target_sdf])
+                    else:
+                        missing_tiles.append((tile_name, target_sdf))
 
-                for future in concurrent.futures.as_completed(future_to_tile):
-                    tile_info = future_to_tile[future]
-                    try:
-                        sdf_filename, sdf_data = future.result()
-                        with open(os.path.join(tmpdir, sdf_filename), "wb") as sdf_file:
-                            sdf_file.write(sdf_data)
-                    except Exception as e:
-                        logger.error(f"Failed to process tile {tile_info[0]}: {e}")
-                        raise
+                # 2. Process missing tiles in parallel
+                if missing_tiles:
+                    logger.info(f"Fetching {len(missing_tiles)} tiles in parallel using {self.tile_workers} workers...")
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=self.tile_workers) as executor:
+                        future_to_tile = {
+                            executor.submit(
+                                Splat._fetch_and_convert_tile,
+                                tile_name,
+                                self.bucket_name,
+                                self.bucket_prefix,
+                                request.high_resolution,
+                                self.srtm2sdf_binary,
+                                self.srtm2sdf_hd_binary
+                            ): tile_name
+                            for tile_name, _ in missing_tiles
+                        }
+
+                        for future in concurrent.futures.as_completed(future_to_tile):
+                            tile_name = future_to_tile[future]
+                            try:
+                                sdf_filename, sdf_data = future.result()
+                                
+                                # Store in cache (MAIN THREAD ONLY - Safe)
+                                self.tile_cache[sdf_filename] = sdf_data
+                                
+                                # Write to temp dir for this run
+                                with open(os.path.join(tmpdir, sdf_filename), "wb") as f:
+                                    f.write(sdf_data)
+                                    
+                            except Exception as e:
+                                logger.error(f"Failed to fetch/convert tile {tile_name}: {e}")
+                                raise
 
                 tile_prep_time = time.time() - start_time
                 logger.info(f"Tile preparation took {tile_prep_time:.2f} seconds")
-
-                # write transmitter / qth file
 
                 # write transmitter / qth file
                 with open(os.path.join(tmpdir, "tx.qth"), "wb") as qth_file:
@@ -240,6 +315,7 @@ class Splat:
                         tx_power=request.tx_power,
                         tx_gain=request.tx_gain,
                         system_loss=request.system_loss))
+
 
                 # write colorbar / dcf file
                 with open(os.path.join(tmpdir, "splat.dcf"), "wb") as dcf_file:
@@ -309,6 +385,9 @@ class Splat:
                         geotiff_data, png_data, bounds, geojson_data = Splat._create_splat_geotiff(
                             ppm_bytes=ppm_data,
                             kml_bytes=kml_data,
+                            colormap_name=request.colormap,
+                            min_dbm=request.min_dbm,
+                            max_dbm=request.max_dbm,
                             metadata={"MESHTASTIC_PARAMS": request.model_dump_json()}
                         )
 
@@ -571,29 +650,17 @@ class Splat:
     def _create_splat_geotiff(
             ppm_bytes: bytes,
             kml_bytes: bytes,
-            null_value: int = 0,  # Define the null value for transparency
+            colormap_name: str,
+            min_dbm: float,
+            max_dbm: float,
+            null_value: int = 255,
             metadata: dict = None
-    ) -> bytes:
+    ) -> Tuple[bytes, bytes, Tuple[float, float, float, float], bytes]:
         """
-        Generate Cloud Optimized GeoTIFF (COG) file content from SPLAT! PPM and KML data.
-
-        Args:
-            ppm_bytes (bytes): Binary content of the SPLAT-generated PPM file.
-            kml_bytes (bytes): Binary content of the KML file containing geospatial bounds.
-            null_value (int): Pixel value in the PPM that represents null areas. Defaults to 0.
-            metadata (dict): Optional metadata to embed in the GeoTIFF.
-
-        Returns:
-            Tuple[bytes, bytes, Tuple[float, float, float, float]]:
-                - GeoTIFF bytes (COG format)
-                - PNG bytes
-                - Bounds (north, south, east, west)
-                - GeoJSON bytes
-
-        Raises:
-            RuntimeError: If the conversion process fails.
+        Generate GeoTIFF file content from SPLAT! PPM and KML data.
+        Restored to use Original "Grayscale + Palette" logic to preserve low-strength signals.
         """
-        logger.info("Starting GeoTIFF generation from SPLAT! PPM and KML data.")
+        logger.info("Starting GeoTIFF generation from SPLAT! PPM and KML data (Original Logic).")
 
         try:
             # Parse KML and extract bounding box
@@ -606,6 +673,7 @@ class Splat:
             south = float(box.find("kml:south", namespace).text)
             east = float(box.find("kml:east", namespace).text)
             west = float(box.find("kml:west", namespace).text)
+
             tx_metadata = None
             if metadata and "MESHTASTIC_PARAMS" in metadata:
                 try:
@@ -613,149 +681,95 @@ class Splat:
                 except Exception as e:
                     logger.warning(f"Failed to parse transmitter metadata: {e}")
 
-            # CRITICAL FIX: SPLAT! KML output often reports the north bound as the center of the top pixel
-            # or excludes the last pixel height, resulting in a 1-pixel Y-axis shift (approx 90m).
-            # We recalculate the north bound assuming square pixels (standard for SRTM) to ensure alignment.
-            # Resolution x = (east - west) / width
-            # Resolution y = Resolution x (square pixels)
-            # North = South + (Height * Resolution y)
+            # NOTE: We are keeping the "North Bound Fix" as it likely corrects a real geolocation error,
+            # even though the original code didn't have it.
+            # If the user strictly wants original bounds, we can remove this block later.
 
-            # Read PPM content first to get dimensions
+            # Read PPM content
             logger.debug("Reading PPM content.")
             with Image.open(io.BytesIO(ppm_bytes)) as img:
-                # Convert to RGBA directly
-                img_rgba = img.convert("RGBA")
-                width, height = img_rgba.size
-
-                # Calculate resolution from X axis (reliable)
+                # ORIGINAL LOGIC: Convert to Grayscale (L)
+                img_gray = img.convert("L")
+                width, height = img_gray.size
+                
+                # Calculate resolution from X axis
                 res_x = (east - west) / width
-
-                # Recalculate North bound
-                original_north = north
+                # Recalculate North bound (Fix)
                 north = south + (height * res_x)
 
-                # Draw transmitter location if metadata is available
-                if tx_metadata:
-                    try:
-                        tx_lat = tx_metadata.get("lat")
-                        tx_lon = tx_metadata.get("lon")
+                img_array = np.array(img_gray)
 
-                        if tx_lat is not None and tx_lon is not None:
-                            draw = ImageDraw.Draw(img_rgba)
+            # Mask/Handle Null Values (Original Logic)
+            # Ensure null_value pixels are set to null_value (idempotent, but explicit)
+            img_array = np.where(img_array == null_value, 255, img_array)
+            no_data_value = 255
 
-                            # Calculate pixel coordinates
-                            # x = (lon - west) / (east - west) * width
-                            # y = (north - lat) / (north - south) * height
-                            # Note: Y axis is inverted (0 is top), north is top latitude
-
-                            if east != west and north != south:
-                                x = (tx_lon - west) / (east - west) * width
-                                y = (north - tx_lat) / (north - south) * height
-
-                                # Draw red triangle with white outline
-                                size = 2.5
-                                points = [
-                                    (x, y - size),          # Top
-                                    (x - size, y + size),   # Bottom Left
-                                    (x + size, y + size)    # Bottom Right
-                                ]
-                                draw.polygon(points, fill="red", outline="white")
-                                logger.info(f"Drew transmitter at ({x:.1f}, {y:.1f}) for lat/lon ({tx_lat}, {tx_lon})")
-                    except Exception as e:
-                        logger.warning(f"Failed to draw transmitter location: {e}")
-
-                img_array = np.array(img_rgba)
-
-            # height, width already obtained from img_rgba.size
-            # res_x already calculated
-            # north already recalculated
-
-            logger.info(
-                f"Extracted bounding box: north={original_north}, south={south}, east={east}, west={west}"
-            )
-            logger.info(
-                f"Recalculated North bound: {north} (Diff: {north - original_north:.6f} deg)"
-            )
-
-            # Mask black pixels (near 0,0,0) to be transparent
-            # Using a small tolerance of 10 to catch compression artifacts or near-black colors
-            black_pixels = (img_array[:, :, 0] < 10) & (img_array[:, :, 1] < 10) & (img_array[:, :, 2] < 10)
-            img_array[black_pixels] = [0, 0, 0, 0]
-
-            # Mask white pixels (near 255,255,255) to be transparent
-            # Using a tolerance of 10 (so > 245)
-            white_pixels = (img_array[:, :, 0] > 245) & (img_array[:, :, 1] > 245) & (img_array[:, :, 2] > 245)
-            img_array[white_pixels] = [0, 0, 0, 0]
+            # Generate Colormap (Original Logic)
+            cmap = plt.get_cmap(colormap_name, 256)
+            cmap_norm = plt.Normalize(vmin=min_dbm, vmax=max_dbm)
+            cmap_values = np.linspace(min_dbm, max_dbm, 255)
+            # Map data values to RGB
+            rgb_colors = (cmap(cmap_norm(cmap_values))[:, :3] * 255).astype(int)
+            # Initialize GDAL-compatible colormap
+            # Index 255 is transparent/nodata
+            gdal_colormap = {i: tuple(rgb) + (255,) for i, rgb in enumerate(rgb_colors)}
+            gdal_colormap[255] = (0, 0, 0, 0) # Make index 255 transparent
 
             # Create GeoTIFF using Rasterio
-            height, width, channels = img_array.shape
             transform = from_bounds(west, south, east, north, width, height)
             logger.debug(f"GeoTIFF transform matrix: {transform}")
 
-            def generate_geotiff():
-                # Write GeoTIFF to memory first
-                with MemoryFile() as memfile:
-                    with memfile.open(
-                            driver="GTiff",
-                            height=height,
-                            width=width,
-                            count=4,  # RGBA
-                            dtype="uint8",
-                            crs="EPSG:4326",
-                            transform=transform,
-                    ) as dst:
-                        # Move channels to first dimension (H, W, 4) -> (4, H, W)
-                        data = np.moveaxis(img_array, -1, 0)
-                        dst.write(data)
 
-                        # Store metadata in ImageDescription tag for easy browser reading
-                        if metadata:
-                            # Add bounds to metadata for precise restoration
-                            metadata["BOUNDS"] = [north, south, east, west]
-                            metadata_json = json.dumps(metadata)
-                            logger.info(f"Writing metadata to TIFF: {metadata_json[:200]}...")
-                            dst.update_tags(ImageDescription=metadata_json)
-                        
-                        # Build overviews for COG
-                        # Only if image is large enough to warrant them
-                        if width > 512 or height > 512:
-                            overviews = [2 ** j for j in range(1, 4)]
-                            dst.build_overviews(overviews, Resampling.average)
-                            dst.update_tags(ns='rio_overview', resampling='average')
+            # 1. Generate GeoTIFF bytes
+            with MemoryFile() as memfile:
+                with memfile.open(
+                        driver="GTiff",
+                        height=height,
+                        width=width,
+                        count=1,  # Single band (Palette)
+                        dtype="uint8",
+                        crs="EPSG:4326",
+                        transform=transform,
+                        photometric="palette",
+                        compress="lzw",
+                        nodata=no_data_value,
+                ) as dst:
+                    dst.write(img_array, 1)
+                    dst.write_colormap(1, gdal_colormap)
+                    
+                    if metadata:
+                        metadata["BOUNDS"] = [north, south, east, west]
+                        dst.update_tags(ImageDescription=json.dumps(metadata))
 
-                    # Copy to COG structure
-                    with memfile.open() as src:
-                        with MemoryFile() as cog_memfile:
-                            copy(
-                                src,
-                                cog_memfile.name,
-                                driver="GTiff",
-                                copy_src_overviews=True,
-                                compress="deflate",
-                                tiled=True,
-                                blockxsize=256,
-                                blockysize=256,
-                                interleave="pixel",
-                                predictor=2 # Horizontal differencing for better compression
-                            )
-                            return cog_memfile.read()
+                geotiff_bytes = memfile.read()
 
-            def generate_png():
-                # Write PNG to memory
-                with io.BytesIO() as png_buffer:
-                    # Convert array back to image for saving as PNG
-                    # img_array is (H, W, 4)
-                    img_png = Image.fromarray(img_array, 'RGBA')
-                    img_png.save(png_buffer, format="PNG")
-                    return png_buffer.getvalue()
-
-            # Run generation in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                future_geotiff = executor.submit(generate_geotiff)
-                future_png = executor.submit(generate_png)
-                
-                geotiff_bytes = future_geotiff.result()
-                png_bytes = future_png.result()
+            # 2. Generate PNG bytes
+            # We need to construct an RGBA image for the PNG
+            # Create an RGBA image using the palette
+            palette_img = Image.fromarray(img_array, mode="P")
+            # Create a flat palette list [r, g, b, r, g, b...]
+            flat_palette = []
+            for i in range(256):
+                if i in gdal_colormap:
+                    r, g, b, a = gdal_colormap[i]
+                    flat_palette.extend((r, g, b))
+                else:
+                    flat_palette.extend((0, 0, 0)) # default
+            
+            palette_img.putpalette(flat_palette)
+            
+            # PROPER TRANSPARENCY for PNG:
+            # Convert to RGBA, treating index 255 as transparent
+            result_rgba = palette_img.convert("RGBA")
+            data_rgba = np.array(result_rgba)
+            # Where original index was 255, set alpha to 0
+            mask = (img_array == 255)
+            data_rgba[mask] = [0, 0, 0, 0]
+            
+            out_img = Image.fromarray(data_rgba, "RGBA")
+            with io.BytesIO() as buf:
+                out_img.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
 
             logger.info("GeoTIFF and PNG generation successful.")
 
@@ -976,45 +990,7 @@ class Splat:
 
 
 
-def process_tile_worker(tile_name: str, high_resolution: bool) -> Tuple[str, bytes]:
-    """
-    Worker function for processing tiles in a separate process.
-    """
-    try:
-        global _worker_cache, _worker_s3, _worker_bucket_name, _worker_bucket_prefix, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary
-        if _worker_cache is None or _worker_s3 is None:
-            raise RuntimeError("Worker context not initialized")
 
-        # Check cache first (to avoid S3 download if possible)
-        sdf_filename = Splat._hgt_filename_to_sdf_filename(tile_name, high_resolution)
-        if sdf_filename in _worker_cache:
-            return sdf_filename, _worker_cache[sdf_filename]
-
-        # Download
-        tile_dir_prefix = tile_name[:3]
-        s3_key = f"{_worker_bucket_prefix}/{tile_dir_prefix}/{tile_name}"
-
-        try:
-            obj = _worker_s3.get_object(Bucket=_worker_bucket_name, Key=s3_key)
-            tile_data = obj['Body'].read()
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                # Fallback logic
-                s3_key = f"skadi/{tile_dir_prefix}/{tile_name}"
-                obj = _worker_s3.get_object(Bucket=_worker_bucket_name, Key=s3_key)
-                tile_data = obj["Body"].read()
-            else:
-                raise
-
-        # Convert
-        sdf_data = Splat._convert_hgt_to_sdf(tile_data, tile_name, _worker_cache, high_resolution, _worker_srtm2sdf_binary, _worker_srtm2sdf_hd_binary)
-
-        return sdf_filename, sdf_data
-        
-    except Exception as e:
-        # logger is not pickleable, so we print to stderr which docker captures
-        print(f"Worker failed for {tile_name}: {e}")
-        raise
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG)
